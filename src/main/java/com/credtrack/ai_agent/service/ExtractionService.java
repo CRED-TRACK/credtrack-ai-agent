@@ -53,28 +53,34 @@ public class ExtractionService {
      */
     public StatementExtraction extract(String bankKey, String emailBody) {
         String cleanBody = prepareBody(emailBody);
-        log.debug("Cleaned body ({} chars) for bank {}: [{}]",
-                cleanBody.length(), bankKey,
-                cleanBody.length() > 500 ? cleanBody.substring(0, 500) + "..." : cleanBody);
+        log.info("Extraction input for bank {} ({} chars): [{}]",
+                bankKey, cleanBody.length(),
+                cleanBody.length() > 800 ? cleanBody.substring(0, 800) + "..." : cleanBody);
 
         String prompt = """
                 You are a JSON-only financial data extractor. Respond with ONLY a valid JSON object — no explanations, no markdown, no code blocks.
 
                 Bank: %s
 
-                If this is NOT a statement email (promotional, alert, payment confirmation, etc), respond with exactly:
+                A statement email is any email that notifies the user that their monthly credit card statement is ready, OR that contains their statement balance/minimum payment. This includes:
+                - "Your statement is ready" / "Your statement is now available" notifications (common for Amex, Citi)
+                - Emails with a statement balance and minimum payment amount
+                - Emails with a link to "View Statement" or "View your statement"
+                These are ALL valid statement emails even if they do NOT include the dollar balance directly.
+
+                If this is NOT a statement email (promotional offer, fraud alert, payment confirmation, transaction alert, account security notice, etc), respond with exactly:
                 {"isStatement":false,"confidence":0.0,"cardDigits":null,"statementBalance":null,"minimumPaymentDue":null,"statementDate":null,"dueDate":null,"viewStatementUrl":null,"makePaymentUrl":null}
 
                 If it IS a monthly statement email, extract these fields:
                 - isStatement: true
-                - cardDigits: last 4-5 digits of the card number shown in the email (string, digits only)
-                - statementBalance: total balance as a number (no $ symbol)
-                - minimumPaymentDue: minimum payment due as a number (no $ symbol)
-                - statementDate: statement closing date in YYYY-MM-DD format
-                - dueDate: payment due date in YYYY-MM-DD format
+                - cardDigits: last 4-5 digits of the card number shown in the email (string, digits only, null if not found)
+                - statementBalance: total balance as a number (no $ symbol), null if not present in the email
+                - minimumPaymentDue: minimum payment due as a number (no $ symbol), null if not present in the email
+                - statementDate: statement closing date in YYYY-MM-DD format, null if not found
+                - dueDate: payment due date in YYYY-MM-DD format, null if not found
                 - viewStatementUrl: full URL to view the statement online (null if not found)
                 - makePaymentUrl: full URL to make a payment (null if not found)
-                - confidence: your confidence from 0.0 to 1.0
+                - confidence: your confidence from 0.0 to 1.0 (use 0.85+ for clear statement-ready notifications)
 
                 Email:
                 %s
@@ -88,7 +94,7 @@ public class ExtractionService {
                     .call()
                     .content();
 
-            log.debug("LLM raw response for bank {}: {}", bankKey, raw);
+            log.info("LLM raw response for bank {}: {}", bankKey, raw);
 
             String json = extractJson(raw);
             StatementExtraction result = MAPPER.readValue(json, StatementExtraction.class);

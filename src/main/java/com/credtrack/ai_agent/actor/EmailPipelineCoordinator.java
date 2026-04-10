@@ -134,7 +134,7 @@ public class EmailPipelineCoordinator extends AbstractBehavior<EmailPipelineCoor
 
             ActorRef<EmailFetcherActor.Command> fetcher =
                     getContext().spawnAnonymous(
-                            EmailFetcherActor.create(gmailService, extractionService, executor));
+                            EmailFetcherActor.create(gmailService, extractionService, backendApiClient, executor));
 
             fetcher.tell(new EmailFetcherActor.FetchEmails(
                     cred, getContext().getSelf(), writer));

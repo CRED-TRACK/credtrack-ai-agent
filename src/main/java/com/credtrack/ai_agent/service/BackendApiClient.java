@@ -124,6 +124,44 @@ public class BackendApiClient {
     }
 
     /**
+     * Marks a card's historical Gmail scan as complete so it is never re-scanned.
+     * POST /internal/cards/{cardId}/gmail-scan-complete
+     */
+    public void markGmailScanComplete(Long cardId) {
+        try {
+            webClient.post()
+                    .uri("/internal/cards/{cardId}/gmail-scan-complete", cardId)
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block();
+            log.info("Gmail scan marked complete for card {}", cardId);
+        } catch (Exception e) {
+            log.error("Failed to mark gmail scan complete for card {}: {}", cardId, e.getMessage());
+        }
+    }
+
+    /**
+     * Updates a card's lastFour — called when a bank displays more digits than stored
+     * (e.g. Amex shows "51006" but user registered "1006").
+     * PATCH /internal/cards/{cardId}/last-four
+     */
+    public void updateCardLastFour(Long cardId, String lastFour) {
+        try {
+            Map<String, Object> body = new HashMap<>();
+            body.put("last_four", lastFour);
+            webClient.patch()
+                    .uri("/internal/cards/{cardId}/last-four", cardId)
+                    .bodyValue(body)
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block();
+            log.info("Card {} lastFour updated to {}", cardId, lastFour);
+        } catch (Exception e) {
+            log.error("Failed to update lastFour for card {}: {}", cardId, e.getMessage());
+        }
+    }
+
+    /**
      * Updates the Gmail historyId cursor after a successful poll cycle.
      * PATCH /internal/gmail-credentials/{userId}
      */

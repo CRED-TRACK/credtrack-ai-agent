@@ -10,10 +10,12 @@ import akka.actor.typed.javadsl.Receive;
 import com.credtrack.ai_agent.model.CardInfo;
 import com.credtrack.ai_agent.model.EmailMessage;
 import com.credtrack.ai_agent.model.GmailUserCredential;
+import com.credtrack.ai_agent.service.BackendApiClient;
 import com.credtrack.ai_agent.service.ExtractionService;
 import com.credtrack.ai_agent.service.GmailService;
 
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
@@ -43,6 +45,7 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
             GmailUserCredential credential,
             List<EmailMessage>  emails,
             Long                newHistoryId,
+            Set<Long>           completedCardScans,
             ActorRef<EmailPipelineCoordinator.Command> coordinator,
             ActorRef<StatementWriterActor.Command>     writer
     ) implements Command {}
@@ -57,24 +60,29 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
 
     public static Behavior<Command> create(GmailService gmailService,
                                            ExtractionService extractionService,
+                                           BackendApiClient backendApiClient,
                                            Executor executor) {
-        return Behaviors.setup(ctx -> new EmailFetcherActor(ctx, gmailService, extractionService, executor));
+        return Behaviors.setup(ctx ->
+                new EmailFetcherActor(ctx, gmailService, extractionService, backendApiClient, executor));
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
 
     private final GmailService      gmailService;
     private final ExtractionService extractionService;
+    private final BackendApiClient  backendApiClient;
     private final Executor          executor;
     private int pendingExtractors = 0;
 
     private EmailFetcherActor(ActorContext<Command> context,
                               GmailService gmailService,
                               ExtractionService extractionService,
+                              BackendApiClient backendApiClient,
                               Executor executor) {
         super(context);
         this.gmailService      = gmailService;
         this.extractionService = extractionService;
+        this.backendApiClient  = backendApiClient;
         this.executor          = executor;
     }
 
@@ -109,7 +117,8 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
                 (result, ex) -> ex != null
                         ? new FetchFailed(userId, ex.getMessage(), msg.coordinator())
                         : new EmailsFetched(msg.credential(), result.emails(),
-                                            result.newHistoryId(), msg.coordinator(), msg.writer())
+                                            result.newHistoryId(), result.completedCardScans(),
+                                            msg.coordinator(), msg.writer())
         );
         return this;
     }
@@ -142,18 +151,32 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
 
             // Spawn one extractor per email and watch it so we know when it finishes
             ActorRef<StatementExtractorActor.Command> extractor =
-                    getContext().spawnAnonymous(StatementExtractorActor.create(extractionService, executor));
+                    getContext().spawnAnonymous(StatementExtractorActor.create(extractionService, backendApiClient, executor));
 
             getContext().watch(extractor);
             pendingExtractors++;
+
+            // All registered cards for this bank — passed to extractor to validate extracted digits
+            List<CardInfo> bankCards = cred.getCards().stream()
+                    .filter(c -> bankKey.equals(c.bankKey()))
+                    .toList();
 
             extractor.tell(new StatementExtractorActor.ExtractStatement(
                     cred.getUserId(),
                     bankKey,
                     matchedCard.lastFour(),
+                    bankCards,
                     email,
                     msg.writer()
             ));
+        }
+
+        // Mark historical scans complete for any newly scanned cards
+        if (msg.completedCardScans() != null && !msg.completedCardScans().isEmpty()) {
+            for (Long cardId : msg.completedCardScans()) {
+                CompletableFuture.runAsync(
+                        () -> backendApiClient.markGmailScanComplete(cardId), executor);
+            }
         }
 
         // Update historyId immediately — don't wait for extractions to complete
