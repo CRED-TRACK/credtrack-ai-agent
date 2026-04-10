@@ -6,13 +6,16 @@ import akka.actor.typed.javadsl.AbstractBehavior;
 import akka.actor.typed.javadsl.ActorContext;
 import akka.actor.typed.javadsl.Behaviors;
 import akka.actor.typed.javadsl.Receive;
+import com.credtrack.ai_agent.model.CardInfo;
 import com.credtrack.ai_agent.model.EmailMessage;
 import com.credtrack.ai_agent.model.StatementExtraction;
+import com.credtrack.ai_agent.service.BackendApiClient;
 import com.credtrack.ai_agent.service.ExtractionService;
 
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.format.DateTimeParseException;
+import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
@@ -33,10 +36,11 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
     public sealed interface Command {}
 
     public record ExtractStatement(
-            String  userId,
-            String  bankKey,
-            String  cardLastFour,          // resolved from backend cards list
-            EmailMessage email,
+            String         userId,
+            String         bankKey,
+            String         cardLastFour,      // resolved from backend cards list
+            List<CardInfo> registeredCards,   // all registered cards for this user+bank — used to validate extracted digits
+            EmailMessage   email,
             ActorRef<StatementWriterActor.Command> writer
     ) implements Command {}
 
@@ -45,20 +49,25 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
 
     // ── Factory ───────────────────────────────────────────────────────────────
 
-    public static Behavior<Command> create(ExtractionService extractionService, Executor executor) {
-        return Behaviors.setup(ctx -> new StatementExtractorActor(ctx, extractionService, executor));
+    public static Behavior<Command> create(ExtractionService extractionService,
+                                           BackendApiClient backendApiClient,
+                                           Executor executor) {
+        return Behaviors.setup(ctx -> new StatementExtractorActor(ctx, extractionService, backendApiClient, executor));
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
 
     private final ExtractionService extractionService;
+    private final BackendApiClient  backendApiClient;
     private final Executor          executor;
 
     private StatementExtractorActor(ActorContext<Command> context,
                                     ExtractionService extractionService,
+                                    BackendApiClient backendApiClient,
                                     Executor executor) {
         super(context);
         this.extractionService = extractionService;
+        this.backendApiClient  = backendApiClient;
         this.executor          = executor;
     }
 
@@ -102,6 +111,34 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
                 ? digits.substring(digits.length() - 4)
                 : src.cardLastFour();   // fallback to card matched before LLM call
 
+        // Reject if the extracted card digits don't match any registered card.
+        // Uses endsWith to handle banks that display extra leading digits (e.g. Amex
+        // shows 5 digits "51006" but registered lastFour may be stored as "51006" —
+        // LLM extracts "51006" → lastFour="1006", and "51006".endsWith("1006") = true).
+        CardInfo matchedCard = src.registeredCards() == null ? null :
+                src.registeredCards().stream()
+                        .filter(c -> c.lastFour().endsWith(lastFour))
+                        .findFirst().orElse(null);
+        if (matchedCard == null) {
+            getContext().getLog().info(
+                    "Skipping {} — card digits {} not in registered cards",
+                    src.email().messageId(), lastFour);
+            return Behaviors.stopped();
+        }
+        // Use the registered card's lastFour by default; upgrade to full extracted
+        // digits if the bank displays more (e.g. Amex "51006" vs stored "1006").
+        String cardLastFourForWrite = matchedCard.lastFour();
+        if (digits.length() > matchedCard.lastFour().length()
+                && digits.endsWith(matchedCard.lastFour())) {
+            // Auto-save the 5-digit display number so future Gmail searches use it
+            cardLastFourForWrite = digits;
+            Long cardIdToUpdate = matchedCard.cardId();
+            CompletableFuture.runAsync(
+                    () -> backendApiClient.updateCardLastFour(cardIdToUpdate, digits), executor);
+            getContext().getLog().info("Auto-updating card {} lastFour {} → {}",
+                    cardIdToUpdate, matchedCard.lastFour(), digits);
+        }
+
         // statementDate = email sent date (Chase sends the email on the statement closing date)
         // Fall back to LLM-extracted statementDate only if sentDate is unavailable
         java.time.LocalDate statementDate = src.email().sentDate() != null
@@ -117,7 +154,7 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
         src.writer().tell(new StatementWriterActor.WriteStatement(
                 src.userId(),
                 src.email().messageId(),
-                lastFour,
+                cardLastFourForWrite,
                 src.bankKey(),
                 toBigDecimal(ex.getStatementBalance()),
                 toBigDecimal(ex.getMinimumPaymentDue()),
