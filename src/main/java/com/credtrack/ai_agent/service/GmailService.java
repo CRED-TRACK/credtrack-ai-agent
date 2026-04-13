@@ -74,11 +74,35 @@ public class GmailService {
         if (historyId == null) {
             // ── Strategy 1: very first poll — full historical search ──────────
             String fromClause = "from:(" + String.join(" OR ", SENDER_DOMAIN_TO_BANK.keySet()) + ")";
-            String cardClause = buildCardClause(cards);
-            String query = fromClause + " subject:statement" + cardClause;
-            log.info("First poll Gmail query: {}", query);
 
-            newHistoryId = searchAndCollect(gmail, query, emails, newHistoryId);
+            // Separate Amex 4-digit cards — Gmail tokenizes "51006" as one token, so
+            // searching "1006" won't find emails that contain "51006". Search Amex
+            // without card digits; the extractor will discover and auto-save the 5-digit value.
+            List<com.credtrack.ai_agent.model.CardInfo> normalCards = cards == null ? List.of() :
+                    cards.stream()
+                            .filter(c -> !("AMEX".equals(c.bankKey()) && c.lastFour().length() == 4))
+                            .toList();
+            List<com.credtrack.ai_agent.model.CardInfo> amex4DigitCards = cards == null ? List.of() :
+                    cards.stream()
+                            .filter(c -> "AMEX".equals(c.bankKey()) && c.lastFour().length() == 4)
+                            .toList();
+
+            // Broad search for all non-Amex cards (and any Amex with 5-digit lastFour)
+            if (!normalCards.isEmpty()) {
+                String cardClause = buildCardClause(normalCards);
+                String query = fromClause + " subject:statement" + cardClause;
+                log.info("First poll Gmail query: {}", query);
+                newHistoryId = searchAndCollect(gmail, query, emails, newHistoryId);
+            }
+
+            // Separate no-digit search per Amex 4-digit card — avoids Gmail tokenization mismatch
+            for (com.credtrack.ai_agent.model.CardInfo amexCard : amex4DigitCards) {
+                String query = "from:americanexpress.com subject:statement";
+                log.info("First poll Amex no-digit search for card {} ({}): {}",
+                        amexCard.cardId(), amexCard.lastFour(), query);
+                searchAndCollect(gmail, query, emails, null);
+            }
+
             if (newHistoryId == null) {
                 newHistoryId = gmail.users().getProfile(USER).execute().getHistoryId().longValue();
             }
