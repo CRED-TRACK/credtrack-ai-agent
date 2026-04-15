@@ -103,6 +103,33 @@ public class GmailService {
                 searchAndCollect(gmail, query, emails, null);
             }
 
+            // Also search for bank payment confirmation emails — these have different subjects
+            // and are missed by the subject:statement filter
+            boolean hasChaseCard = cards != null && cards.stream().anyMatch(c -> "CHASE".equals(c.bankKey()));
+            if (hasChaseCard) {
+                String paymentQuery = "from:chase.com (\"payment is scheduled\" OR \"payment scheduled\")";
+                log.info("First poll Chase payment query: {}", paymentQuery);
+                searchAndCollect(gmail, paymentQuery, emails, null);
+            }
+            boolean hasBoaCard = cards != null && cards.stream().anyMatch(c -> "BOA".equals(c.bankKey()));
+            if (hasBoaCard) {
+                String paymentQuery = "from:ealerts.bankofamerica.com \"received your credit card payment\"";
+                log.info("First poll BOA payment query: {}", paymentQuery);
+                searchAndCollect(gmail, paymentQuery, emails, null);
+            }
+            boolean hasDiscoverCard = cards != null && cards.stream().anyMatch(c -> "DISCOVER".equals(c.bankKey()));
+            if (hasDiscoverCard) {
+                String paymentQuery = "from:services.discover.com \"scheduled payment\"";
+                log.info("First poll Discover payment query: {}", paymentQuery);
+                searchAndCollect(gmail, paymentQuery, emails, null);
+            }
+            boolean hasAmexCard = cards != null && cards.stream().anyMatch(c -> "AMEX".equals(c.bankKey()));
+            if (hasAmexCard) {
+                String paymentQuery = "from:welcome.americanexpress.com \"received your payment\"";
+                log.info("First poll Amex payment query: {}", paymentQuery);
+                searchAndCollect(gmail, paymentQuery, emails, null);
+            }
+
             if (newHistoryId == null) {
                 newHistoryId = gmail.users().getProfile(USER).execute().getHistoryId().longValue();
             }
@@ -141,6 +168,25 @@ public class GmailService {
                                 : "from:" + bankDomain + " subject:statement " + card.lastFour();
                         log.info("Historical scan for new card {} ({}, {}): {}", card.cardId(), card.lastFour(), card.bankKey(), query);
                         searchAndCollect(gmail, query, emails, null);
+
+                        // Also fetch payment confirmation emails — not caught by subject:statement filter
+                        if ("CHASE".equals(card.bankKey())) {
+                            String paymentQuery = "from:chase.com (\"payment is scheduled\" OR \"payment scheduled\") " + card.lastFour();
+                            log.info("Historical payment scan for new Chase card {}: {}", card.cardId(), paymentQuery);
+                            searchAndCollect(gmail, paymentQuery, emails, null);
+                        } else if ("BOA".equals(card.bankKey())) {
+                            String paymentQuery = "from:ealerts.bankofamerica.com \"received your credit card payment\" " + card.lastFour();
+                            log.info("Historical payment scan for new BOA card {}: {}", card.cardId(), paymentQuery);
+                            searchAndCollect(gmail, paymentQuery, emails, null);
+                        } else if ("DISCOVER".equals(card.bankKey())) {
+                            String paymentQuery = "from:services.discover.com \"scheduled payment\" " + card.lastFour();
+                            log.info("Historical payment scan for new Discover card {}: {}", card.cardId(), paymentQuery);
+                            searchAndCollect(gmail, paymentQuery, emails, null);
+                        } else if ("AMEX".equals(card.bankKey())) {
+                            String paymentQuery = "from:welcome.americanexpress.com \"received your payment\" " + card.lastFour();
+                            log.info("Historical payment scan for new Amex card {}: {}", card.cardId(), paymentQuery);
+                            searchAndCollect(gmail, paymentQuery, emails, null);
+                        }
                         completedCardScans.add(card.cardId());
 
                     } else if (isInStatementWindow(card.lastStatementDate())) {
@@ -157,6 +203,32 @@ public class GmailService {
                         String query = "from:" + bankDomain2 + " subject:statement " + card.lastFour() + " " + dateRange;
                         log.info("Statement window search for card {} ({}, {}): {}", card.cardId(), card.lastFour(), card.bankKey(), query);
                         searchAndCollect(gmail, query, emails, null);
+                    }
+                }
+            }
+
+            // ── Strategy 4: Payment catch-up for cards with unpaid statements ────────
+            // For any supported card with hasUnpaidStatements=true, search for payment
+            // confirmation emails that may have been sent before the historyId cursor was set.
+            if (cards != null) {
+                for (com.credtrack.ai_agent.model.CardInfo card : cards) {
+                    if (!card.hasUnpaidStatements()) continue;
+                    if ("CHASE".equals(card.bankKey())) {
+                        String paymentQuery = "from:chase.com (\"payment is scheduled\" OR \"payment scheduled\") " + card.lastFour();
+                        log.info("Chase payment catch-up for card {} ({}): {}", card.cardId(), card.lastFour(), paymentQuery);
+                        searchAndCollect(gmail, paymentQuery, emails, null);
+                    } else if ("BOA".equals(card.bankKey())) {
+                        String paymentQuery = "from:ealerts.bankofamerica.com \"received your credit card payment\" " + card.lastFour();
+                        log.info("BOA payment catch-up for card {} ({}): {}", card.cardId(), card.lastFour(), paymentQuery);
+                        searchAndCollect(gmail, paymentQuery, emails, null);
+                    } else if ("DISCOVER".equals(card.bankKey())) {
+                        String paymentQuery = "from:services.discover.com \"scheduled payment\" " + card.lastFour();
+                        log.info("Discover payment catch-up for card {} ({}): {}", card.cardId(), card.lastFour(), paymentQuery);
+                        searchAndCollect(gmail, paymentQuery, emails, null);
+                    } else if ("AMEX".equals(card.bankKey())) {
+                        String paymentQuery = "from:welcome.americanexpress.com \"received your payment\" " + card.lastFour();
+                        log.info("Amex payment catch-up for card {} ({}): {}", card.cardId(), card.lastFour(), paymentQuery);
+                        searchAndCollect(gmail, paymentQuery, emails, null);
                     }
                 }
             }
