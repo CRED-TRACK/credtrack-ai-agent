@@ -32,6 +32,9 @@ public class BackendApiClient {
                 .baseUrl(baseUrl)
                 .defaultHeader("X-Service-Key", serviceKey)
                 .defaultHeader("Content-Type", "application/json")
+                .clientConnector(new org.springframework.http.client.reactive.ReactorClientHttpConnector(
+                        reactor.netty.http.client.HttpClient.create()
+                                .responseTimeout(java.time.Duration.ofSeconds(30))))
                 .build();
 
         this.mapper = new ObjectMapper()
@@ -56,46 +59,49 @@ public class BackendApiClient {
      * Posts an extracted statement to the existing backend.
      * POST /internal/statements — 201 on success, 409 on duplicate.
      */
-    public void postStatement(String userId,
-                               String gmailMessageId,
-                               String cardLastFour,
-                               String bankKey,
-                               BigDecimal statementBalance,
-                               BigDecimal minimumDue,
-                               LocalDate  statementDate,
-                               LocalDate  dueDate,
-                               String     viewStatementUrl,
-                               String     makePaymentUrl) {
-        try {
-            // Backend uses SNAKE_CASE Jackson strategy — Map keys must be snake_case
-            // because Jackson does NOT transform Map keys, only POJO field names.
-            Map<String, Object> body = new HashMap<>();
-            body.put("user_id",              userId);
-            body.put("gmail_message_id",     gmailMessageId);
-            body.put("card_last_four",       cardLastFour);
-            body.put("bank",                 bankKey);
-            body.put("statement_balance",    statementBalance);
-            body.put("minimum_payment_due",  minimumDue);
-            body.put("statement_date",       statementDate != null ? statementDate.toString() : null);
-            body.put("due_date",             dueDate != null ? dueDate.toString() : null);
-            body.put("view_statement_url",   viewStatementUrl);
-            body.put("make_payment_url",     makePaymentUrl);
+    /**
+     * Returns true if the statement was newly saved, false if it was a duplicate (409).
+     * Throws RuntimeException on any other error so the caller can log it as a failure.
+     */
+    public boolean postStatement(String userId,
+                                 String gmailMessageId,
+                                 String cardLastFour,
+                                 String bankKey,
+                                 BigDecimal statementBalance,
+                                 BigDecimal minimumDue,
+                                 LocalDate  statementDate,
+                                 LocalDate  dueDate,
+                                 String     viewStatementUrl,
+                                 String     makePaymentUrl) {
+        // Backend uses SNAKE_CASE Jackson strategy — Map keys must be snake_case
+        // because Jackson does NOT transform Map keys, only POJO field names.
+        Map<String, Object> body = new HashMap<>();
+        body.put("user_id",              userId);
+        body.put("gmail_message_id",     gmailMessageId);
+        body.put("card_last_four",       cardLastFour);
+        body.put("bank",                 bankKey);
+        body.put("statement_balance",    statementBalance);
+        body.put("minimum_payment_due",  minimumDue);
+        body.put("statement_date",       statementDate != null ? statementDate.toString() : null);
+        body.put("due_date",             dueDate != null ? dueDate.toString() : null);
+        body.put("view_statement_url",   viewStatementUrl);
+        body.put("make_payment_url",     makePaymentUrl);
 
+        try {
             webClient.post()
                     .uri("/internal/statements")
                     .bodyValue(body)
                     .retrieve()
                     .toBodilessEntity()
                     .block();
-
             log.info("Statement saved: {} for user {}", gmailMessageId, userId);
-
+            return true;
         } catch (Exception e) {
             if (e.getMessage() != null && e.getMessage().contains("409")) {
                 log.debug("Duplicate statement skipped: {}", gmailMessageId);
-            } else {
-                log.error("Failed to save statement {}: {}", gmailMessageId, e.getMessage());
+                return false;
             }
+            throw new RuntimeException("Failed to save statement " + gmailMessageId + ": " + e.getMessage(), e);
         }
     }
 
@@ -124,19 +130,19 @@ public class BackendApiClient {
     }
 
     /**
-     * Marks a card's historical Gmail scan as complete so it is never re-scanned.
-     * POST /internal/cards/{cardId}/gmail-scan-complete
+     * Marks a card's one-time init scan as complete so it is never re-scanned.
+     * POST /internal/cards/{cardId}/init-complete
      */
-    public void markGmailScanComplete(Long cardId) {
+    public void markInitComplete(Long cardId) {
         try {
             webClient.post()
-                    .uri("/internal/cards/{cardId}/gmail-scan-complete", cardId)
+                    .uri("/internal/cards/{cardId}/init-complete", cardId)
                     .retrieve()
                     .toBodilessEntity()
                     .block();
-            log.info("Gmail scan marked complete for card {}", cardId);
+            log.info("Init scan marked complete for card {}", cardId);
         } catch (Exception e) {
-            log.error("Failed to mark gmail scan complete for card {}: {}", cardId, e.getMessage());
+            log.error("Failed to mark init-complete for card {}: {}", cardId, e.getMessage());
         }
     }
 
