@@ -24,7 +24,8 @@ import java.util.concurrent.Executor;
  * 1. Fetches emails from Gmail (bank sender filter applied inside GmailService)
  * 2. For each email: resolves bankKey + cardLastFour from credential cards list
  * 3. Skips emails with no matching registered card (saves LLM cost)
- * 4. Spawns one StatementExtractorActor per eligible email
+ * 4a. Chase payment emails → spawns PaymentExtractorActor (regex, no LLM)
+ * 4b. All other bank emails → spawns StatementExtractorActor (LLM extraction)
  * 5. Reports FetchComplete to coordinator immediately (historyId updated regardless
  *    of whether individual extractions succeed — avoids reprocessing same emails)
  * 6. Stops itself
@@ -149,26 +150,42 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
                 continue;
             }
 
-            // Spawn one extractor per email and watch it so we know when it finishes
-            ActorRef<StatementExtractorActor.Command> extractor =
-                    getContext().spawnAnonymous(StatementExtractorActor.create(extractionService, backendApiClient, executor));
-
-            getContext().watch(extractor);
-            pendingExtractors++;
-
-            // All registered cards for this bank — passed to extractor to validate extracted digits
+            // All registered cards for this bank — used by extractors to validate digits
             List<CardInfo> bankCards = cred.getCards().stream()
                     .filter(c -> bankKey.equals(c.bankKey()))
                     .toList();
 
-            extractor.tell(new StatementExtractorActor.ExtractStatement(
-                    cred.getUserId(),
-                    bankKey,
-                    matchedCard.lastFour(),
-                    bankCards,
-                    email,
-                    msg.writer()
-            ));
+            if (isPaymentEmail(email, bankKey)) {
+                // ── Chase payment confirmation email — regex parse, no LLM ──────
+                ActorRef<PaymentExtractorActor.Command> paymentExtractor =
+                        getContext().spawnAnonymous(
+                                PaymentExtractorActor.create(backendApiClient, executor));
+                getContext().watch(paymentExtractor);
+                pendingExtractors++;
+
+                paymentExtractor.tell(new PaymentExtractorActor.ExtractPayment(
+                        cred.getUserId(),
+                        bankKey,
+                        bankCards,
+                        email
+                ));
+            } else {
+                // ── Statement email — LLM extraction ─────────────────────────────
+                ActorRef<StatementExtractorActor.Command> extractor =
+                        getContext().spawnAnonymous(
+                                StatementExtractorActor.create(extractionService, backendApiClient, executor));
+                getContext().watch(extractor);
+                pendingExtractors++;
+
+                extractor.tell(new StatementExtractorActor.ExtractStatement(
+                        cred.getUserId(),
+                        bankKey,
+                        matchedCard.lastFour(),
+                        bankCards,
+                        email,
+                        msg.writer()
+                ));
+            }
         }
 
         // Mark historical scans complete for any newly scanned cards
@@ -208,5 +225,24 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
                 new EmailPipelineCoordinator.FetchFailed(msg.userId(), msg.reason())
         );
         return Behaviors.stopped();
+    }
+
+    /**
+     * Returns true if this email is a bank payment confirmation (not a statement).
+     * Supported: Chase ("payment is scheduled") and BOA ("received your credit card payment").
+     */
+    private boolean isPaymentEmail(EmailMessage email, String bankKey) {
+        String subject = email.subject();
+        if (subject == null) return false;
+        String lower = subject.toLowerCase();
+        return switch (bankKey) {
+            case "CHASE"    -> lower.contains("payment is scheduled")
+                    || lower.contains("payment scheduled")
+                    || lower.contains("payment has been scheduled");
+            case "BOA"      -> lower.contains("received your credit card payment");
+            case "DISCOVER" -> lower.contains("scheduled payment");
+            case "AMEX"    -> lower.contains("received your payment");
+            default        -> false;
+        };
     }
 }

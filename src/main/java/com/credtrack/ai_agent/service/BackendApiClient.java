@@ -162,6 +162,45 @@ public class BackendApiClient {
     }
 
     /**
+     * Posts an extracted Chase payment confirmation to the backend.
+     * POST /internal/payments — 204 on success, 409 on duplicate gmailMessageId.
+     */
+    public void postPayment(String userId,
+                             String gmailMessageId,
+                             String cardLastFour,
+                             String bank,
+                             BigDecimal amount,
+                             LocalDate  paymentDate,
+                             LocalDate  effectiveDate) {
+        try {
+            Map<String, Object> body = new HashMap<>();
+            body.put("user_id",          userId);
+            body.put("gmail_message_id", gmailMessageId);
+            body.put("card_last_four",   cardLastFour);
+            body.put("bank",             bank);
+            body.put("amount",           amount);
+            body.put("payment_date",     paymentDate  != null ? paymentDate.toString()  : null);
+            body.put("effective_date",   effectiveDate != null ? effectiveDate.toString() : null);
+
+            webClient.post()
+                    .uri("/internal/payments")
+                    .bodyValue(body)
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block();
+
+            log.info("Payment saved: {} for user {} amount={}", gmailMessageId, userId, amount);
+
+        } catch (Exception e) {
+            if (e.getMessage() != null && e.getMessage().contains("409")) {
+                log.debug("Duplicate payment skipped: {}", gmailMessageId);
+            } else {
+                log.error("Failed to save payment {}: {}", gmailMessageId, e.getMessage());
+            }
+        }
+    }
+
+    /**
      * Updates the Gmail historyId cursor after a successful poll cycle.
      * PATCH /internal/gmail-credentials/{userId}
      */
