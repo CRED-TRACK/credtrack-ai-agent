@@ -15,20 +15,22 @@ import com.credtrack.ai_agent.service.ExtractionService;
 import com.credtrack.ai_agent.service.GmailService;
 
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 
 /**
- * Spawned once per user per poll cycle.
- * 1. Fetches emails from Gmail (bank sender filter applied inside GmailService)
- * 2. For each email: resolves bankKey + cardLastFour from credential cards list
- * 3. Skips emails with no matching registered card (saves LLM cost)
- * 4a. Chase payment emails → spawns PaymentExtractorActor (regex, no LLM)
- * 4b. All other bank emails → spawns StatementExtractorActor (LLM extraction)
- * 5. Reports FetchComplete to coordinator immediately (historyId updated regardless
- *    of whether individual extractions succeed — avoids reprocessing same emails)
- * 6. Stops itself
+ * Spawned once per user per poll cycle — handles the NORMAL (incremental) poll path only.
+ *
+ * Historical / init scans for new cards are handled exclusively by InitCardScanActor.
+ * This actor only processes emails that arrived since the last historyId cursor.
+ *
+ * Flow:
+ *   1. Calls GmailService.fetchNewEmails() — pure incremental, no keyword searches.
+ *   2. For each bank email: resolves bankKey + best candidate card.
+ *   3a. Payment emails → spawns PaymentExtractorActor (regex, no LLM).
+ *   3b. Statement emails → spawns StatementExtractorActor (LLM extraction).
+ *   4. Waits for ALL extractors before advancing the historyId cursor.
+ *      If any LLM call fails, historyId is NOT advanced so the next poll retries.
  */
 public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Command> {
 
@@ -42,11 +44,18 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
             ActorRef<StatementWriterActor.Command>     writer
     ) implements Command {}
 
+    /**
+     * Sent by StatementExtractorActor before it stops.
+     * {@code llmFailed=true} means the LLM call failed (e.g. Ollama connection refused).
+     * {@code llmFailed=false} means the email was handled normally (saved, skipped as
+     * non-statement, or rejected because card digits didn't match).
+     */
+    public record LlmExtractorResult(boolean llmFailed) implements Command {}
+
     private record EmailsFetched(
             GmailUserCredential credential,
             List<EmailMessage>  emails,
             Long                newHistoryId,
-            Set<Long>           completedCardScans,
             ActorRef<EmailPipelineCoordinator.Command> coordinator,
             ActorRef<StatementWriterActor.Command>     writer
     ) implements Command {}
@@ -73,7 +82,22 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
     private final ExtractionService extractionService;
     private final BackendApiClient  backendApiClient;
     private final Executor          executor;
+
+    // Message adapter: receives LlmExtractorResult from StatementExtractorActor and delivers
+    // it back into this actor's mailbox as a LlmExtractorResult (which implements Command).
+    private final ActorRef<LlmExtractorResult> llmResultRef;
+
+    // Counts active child extractors (both statement and payment).
     private int pendingExtractors = 0;
+
+    // Set to true if any StatementExtractorActor reports an LLM failure.
+    // When true we do NOT advance historyId so the next poll retries the failed emails.
+    private boolean anyLlmFailure = false;
+
+    // Stored from EmailsFetched; consumed when all extractors finish.
+    private String                                     pendingUserId;
+    private Long                                       pendingNewHistoryId;
+    private ActorRef<EmailPipelineCoordinator.Command> pendingCoordinator;
 
     private EmailFetcherActor(ActorContext<Command> context,
                               GmailService gmailService,
@@ -85,6 +109,8 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
         this.extractionService = extractionService;
         this.backendApiClient  = backendApiClient;
         this.executor          = executor;
+        // Adapter: LlmExtractorResult → LlmExtractorResult (identity — it already implements Command)
+        this.llmResultRef = context.messageAdapter(LlmExtractorResult.class, r -> r);
     }
 
     // ── Behavior ──────────────────────────────────────────────────────────────
@@ -92,10 +118,11 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
     @Override
     public Receive<Command> createReceive() {
         return newReceiveBuilder()
-                .onMessage(FetchEmails.class,   this::onFetch)
-                .onMessage(EmailsFetched.class, this::onFetched)
-                .onMessage(FetchFailed.class,   this::onFailed)
-                .onSignal(Terminated.class,     this::onExtractorTerminated)
+                .onMessage(FetchEmails.class,        this::onFetch)
+                .onMessage(EmailsFetched.class,      this::onFetched)
+                .onMessage(FetchFailed.class,        this::onFailed)
+                .onMessage(LlmExtractorResult.class, this::onLlmResult)
+                .onSignal(Terminated.class,          this::onExtractorTerminated)
                 .build();
     }
 
@@ -109,8 +136,7 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
                     try {
                         return gmailService.fetchNewEmails(
                                 msg.credential().getAccessToken(),
-                                msg.credential().getHistoryId(),
-                                msg.credential().getCards());
+                                msg.credential().getHistoryId());
                     } catch (Exception e) {
                         throw new RuntimeException(e);
                     }
@@ -118,7 +144,7 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
                 (result, ex) -> ex != null
                         ? new FetchFailed(userId, ex.getMessage(), msg.coordinator())
                         : new EmailsFetched(msg.credential(), result.emails(),
-                                            result.newHistoryId(), result.completedCardScans(),
+                                            result.newHistoryId(),
                                             msg.coordinator(), msg.writer())
         );
         return this;
@@ -129,14 +155,14 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
         getContext().getLog().info("Fetched {} bank emails for user {}",
                 msg.emails().size(), cred.getUserId());
 
+        pendingUserId      = cred.getUserId();
+        pendingNewHistoryId = msg.newHistoryId();
+        pendingCoordinator = msg.coordinator();
+
         for (EmailMessage email : msg.emails()) {
-            // Resolve bankKey from sender domain
             String bankKey = GmailService.resolveBankKey(email.senderDomain());
             if (bankKey == null) continue;
 
-            // Match to a registered card by bankKey + last 4 digits shown in email
-            // We spawn the extractor and let it confirm the digits after LLM extraction.
-            // Here we find the best candidate card for this bank.
             CardInfo matchedCard = cred.getCards() == null ? null :
                     cred.getCards().stream()
                             .filter(c -> bankKey.equals(c.bankKey()))
@@ -150,13 +176,12 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
                 continue;
             }
 
-            // All registered cards for this bank — used by extractors to validate digits
             List<CardInfo> bankCards = cred.getCards().stream()
                     .filter(c -> bankKey.equals(c.bankKey()))
                     .toList();
 
             if (isPaymentEmail(email, bankKey)) {
-                // ── Chase payment confirmation email — regex parse, no LLM ──────
+                // ── Payment confirmation email — regex parse, no LLM ─────────
                 ActorRef<PaymentExtractorActor.Command> paymentExtractor =
                         getContext().spawnAnonymous(
                                 PaymentExtractorActor.create(backendApiClient, executor));
@@ -164,13 +189,9 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
                 pendingExtractors++;
 
                 paymentExtractor.tell(new PaymentExtractorActor.ExtractPayment(
-                        cred.getUserId(),
-                        bankKey,
-                        bankCards,
-                        email
-                ));
+                        cred.getUserId(), bankKey, bankCards, email));
             } else {
-                // ── Statement email — LLM extraction ─────────────────────────────
+                // ── Statement email — LLM extraction ─────────────────────────
                 ActorRef<StatementExtractorActor.Command> extractor =
                         getContext().spawnAnonymous(
                                 StatementExtractorActor.create(extractionService, backendApiClient, executor));
@@ -183,28 +204,28 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
                         matchedCard.lastFour(),
                         bankCards,
                         email,
-                        msg.writer()
+                        msg.writer(),
+                        llmResultRef   // typed as ActorRef<LlmExtractorResult>
                 ));
             }
         }
 
-        // Mark historical scans complete for any newly scanned cards
-        if (msg.completedCardScans() != null && !msg.completedCardScans().isEmpty()) {
-            for (Long cardId : msg.completedCardScans()) {
-                CompletableFuture.runAsync(
-                        () -> backendApiClient.markGmailScanComplete(cardId), executor);
-            }
-        }
-
-        // Update historyId immediately — don't wait for extractions to complete
-        msg.coordinator().tell(
-                new EmailPipelineCoordinator.FetchComplete(cred.getUserId(), msg.newHistoryId())
-        );
-
-        // If no extractors were spawned we can stop right away; otherwise wait
-        // for all children to terminate (via onExtractorTerminated) before stopping.
         if (pendingExtractors == 0) {
-            return Behaviors.stopped();
+            return onAllExtractorsFinished();
+        }
+        return this;
+    }
+
+    /**
+     * Received from StatementExtractorActor before it stops.
+     * Tracks whether any LLM call failed so we can suppress historyId advancement.
+     */
+    private Behavior<Command> onLlmResult(LlmExtractorResult msg) {
+        if (msg.llmFailed()) {
+            anyLlmFailure = true;
+            getContext().getLog().warn(
+                    "LLM extraction failure reported — historyId will NOT be advanced " +
+                    "this cycle; affected emails will be retried on next poll.");
         }
         return this;
     }
@@ -213,23 +234,42 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
         pendingExtractors--;
         getContext().getLog().debug("Extractor terminated, {} still pending", pendingExtractors);
         if (pendingExtractors <= 0) {
-            getContext().getLog().info("All extractors finished — stopping EmailFetcherActor");
-            return Behaviors.stopped();
+            return onAllExtractorsFinished();
         }
         return this;
+    }
+
+    /**
+     * Called when every spawned child extractor has terminated.
+     *
+     * If any LLM call failed: skip historyId advance so the next poll retries.
+     * If all completed normally: advance historyId via the coordinator.
+     */
+    private Behavior<Command> onAllExtractorsFinished() {
+        getContext().getLog().info("All extractors finished for user {}", pendingUserId);
+
+        if (anyLlmFailure) {
+            getContext().getLog().warn(
+                    "Suppressing historyId advance for user {} due to LLM failure(s). " +
+                    "Emails will be retried on next poll cycle.", pendingUserId);
+        } else {
+            if (pendingCoordinator != null) {
+                pendingCoordinator.tell(
+                        new EmailPipelineCoordinator.FetchComplete(pendingUserId, pendingNewHistoryId));
+            }
+        }
+        return Behaviors.stopped();
     }
 
     private Behavior<Command> onFailed(FetchFailed msg) {
         getContext().getLog().error("Gmail fetch failed for user {}: {}", msg.userId(), msg.reason());
         msg.coordinator().tell(
-                new EmailPipelineCoordinator.FetchFailed(msg.userId(), msg.reason())
-        );
+                new EmailPipelineCoordinator.FetchFailed(msg.userId(), msg.reason()));
         return Behaviors.stopped();
     }
 
     /**
      * Returns true if this email is a bank payment confirmation (not a statement).
-     * Supported: Chase ("payment is scheduled") and BOA ("received your credit card payment").
      */
     private boolean isPaymentEmail(EmailMessage email, String bankKey) {
         String subject = email.subject();
@@ -241,8 +281,8 @@ public class EmailFetcherActor extends AbstractBehavior<EmailFetcherActor.Comman
                     || lower.contains("payment has been scheduled");
             case "BOA"      -> lower.contains("received your credit card payment");
             case "DISCOVER" -> lower.contains("scheduled payment");
-            case "AMEX"    -> lower.contains("received your payment");
-            default        -> false;
+            case "AMEX"     -> lower.contains("received your payment");
+            default         -> false;
         };
     }
 }

@@ -98,6 +98,9 @@ public class PaymentExtractorActor extends AbstractBehavior<PaymentExtractorActo
 
     private record ParseFailed(String messageId, String reason) implements Command {}
 
+    /** Fired once the HTTP POST /internal/payments call returns (success or failure). */
+    private record HttpPosted() implements Command {}
+
     // ── Factory ───────────────────────────────────────────────────────────────
 
     public static Behavior<Command> create(BackendApiClient backendApiClient, Executor executor) {
@@ -125,6 +128,7 @@ public class PaymentExtractorActor extends AbstractBehavior<PaymentExtractorActo
                 .onMessage(ExtractPayment.class, this::onExtract)
                 .onMessage(ParseDone.class,      this::onDone)
                 .onMessage(ParseFailed.class,    this::onFailed)
+                .onMessage(HttpPosted.class,     msg -> Behaviors.stopped())
                 .build();
     }
 
@@ -210,18 +214,30 @@ public class PaymentExtractorActor extends AbstractBehavior<PaymentExtractorActo
                 "Payment parsed from {} — card={} amount={} paymentDate={}",
                 src.email().messageId(), msg.cardLastFour(), msg.amount(), msg.paymentDate());
 
-        CompletableFuture.runAsync(() ->
-                backendApiClient.postPayment(
-                        src.userId(),
-                        src.email().messageId(),
-                        msg.cardLastFour(),
-                        src.bankKey(),
-                        msg.amount(),
-                        msg.paymentDate(),
-                        msg.effectiveDate()
-                ), executor);
-
-        return Behaviors.stopped();
+        // Use pipeToSelf so the actor stays alive until the HTTP call returns.
+        // The Terminated signal (watched by InitCardScanActor) will only fire after
+        // the backend has committed this payment — ensuring the next payment is
+        // sent only after the previous one is fully persisted (sequential guarantee).
+        getContext().pipeToSelf(
+                CompletableFuture.runAsync(() ->
+                        backendApiClient.postPayment(
+                                src.userId(),
+                                src.email().messageId(),
+                                msg.cardLastFour(),
+                                src.bankKey(),
+                                msg.amount(),
+                                msg.paymentDate(),
+                                msg.effectiveDate()
+                        ), executor),
+                (v, ex) -> {
+                    if (ex != null) {
+                        getContext().getLog().warn("HTTP postPayment failed for {}: {}",
+                                src.email().messageId(), ex.getMessage());
+                    }
+                    return new HttpPosted();   // stop regardless — orphan is fine, dedup prevents double-post
+                }
+        );
+        return this;
     }
 
     private Behavior<Command> onFailed(ParseFailed msg) {

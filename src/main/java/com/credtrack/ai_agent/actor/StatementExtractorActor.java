@@ -26,6 +26,12 @@ import java.util.concurrent.Executor;
  *
  * Bank and card are resolved BEFORE this actor is spawned —
  * the LLM only extracts numbers, dates, and URLs.
+ *
+ * Before stopping, sends an {@link EmailFetcherActor.LlmExtractorResult} back to
+ * the parent EmailFetcherActor so it knows whether the LLM call succeeded.
+ * If the LLM was unavailable (connection refused, timeout, etc.), {@code llmFailed=true}
+ * is reported and the parent will suppress historyId advancement — causing the
+ * email to be retried on the next poll cycle.
  */
 public class StatementExtractorActor extends AbstractBehavior<StatementExtractorActor.Command> {
 
@@ -41,7 +47,8 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
             String         cardLastFour,      // resolved from backend cards list
             List<CardInfo> registeredCards,   // all registered cards for this user+bank — used to validate extracted digits
             EmailMessage   email,
-            ActorRef<StatementWriterActor.Command> writer
+            ActorRef<StatementWriterActor.Command>          writer,
+            ActorRef<EmailFetcherActor.LlmExtractorResult> replyTo  // receives LlmExtractorResult before this actor stops
     ) implements Command {}
 
     private record ExtractionDone(StatementExtraction result, ExtractStatement original) implements Command {}
@@ -60,6 +67,9 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
     private final ExtractionService extractionService;
     private final BackendApiClient  backendApiClient;
     private final Executor          executor;
+
+    // Stored on first message so onFailed can reply even though it only has messageId.
+    private ActorRef<EmailFetcherActor.LlmExtractorResult> replyTo;
 
     private StatementExtractorActor(ActorContext<Command> context,
                                     ExtractionService extractionService,
@@ -83,6 +93,9 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
     }
 
     private Behavior<Command> onExtract(ExtractStatement msg) {
+        // Capture replyTo so onFailed can use it (it only receives messageId + reason).
+        this.replyTo = msg.replyTo();
+
         getContext().pipeToSelf(
                 CompletableFuture.supplyAsync(() ->
                         extractionService.extract(msg.bankKey(), msg.email().body()), executor
@@ -102,6 +115,8 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
             getContext().getLog().debug(
                     "Skipping {} — isStatement={} confidence={}",
                     src.email().messageId(), ex.isStatement(), ex.getConfidence());
+            // Legitimate skip — LLM responded normally, just not a statement email.
+            src.replyTo().tell(new EmailFetcherActor.LlmExtractorResult(false));
             return Behaviors.stopped();
         }
 
@@ -123,6 +138,8 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
             getContext().getLog().info(
                     "Skipping {} — card digits {} not in registered cards",
                     src.email().messageId(), lastFour);
+            // LLM responded fine — we just don't have a matching card.
+            src.replyTo().tell(new EmailFetcherActor.LlmExtractorResult(false));
             return Behaviors.stopped();
         }
         // Use the registered card's lastFour by default; upgrade to full extracted
@@ -139,11 +156,12 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
                     cardIdToUpdate, matchedCard.lastFour(), digits);
         }
 
-        // statementDate = email sent date (Chase sends the email on the statement closing date)
-        // Fall back to LLM-extracted statementDate only if sentDate is unavailable
-        java.time.LocalDate statementDate = src.email().sentDate() != null
-                ? src.email().sentDate()
-                : parseDate(ex.getStatementDate());
+        // Prefer LLM-extracted statementDate — it reflects the actual closing date printed
+        // in the email. Some banks (e.g. BOA) send the notification 2-4 days after closing,
+        // so using the email's sentDate would record the wrong date.
+        // Fall back to sentDate only when the LLM didn't extract a date.
+        java.time.LocalDate llmDate = parseDate(ex.getStatementDate());
+        java.time.LocalDate statementDate = llmDate != null ? llmDate : src.email().sentDate();
 
         // Prefer URLs extracted directly from HTML (full, untruncated) over LLM output
         String viewUrl = src.email().viewStatementUrl() != null
@@ -164,11 +182,17 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
                 payUrl
         ));
 
+        // LLM responded and data was forwarded for writing — success.
+        src.replyTo().tell(new EmailFetcherActor.LlmExtractorResult(false));
         return Behaviors.stopped();
     }
 
     private Behavior<Command> onFailed(ExtractionFailed msg) {
-        getContext().getLog().error("Extraction failed for {}: {}", msg.messageId(), msg.reason());
+        getContext().getLog().error("LLM extraction failed for {}: {}", msg.messageId(), msg.reason());
+        // Signal that the LLM was unavailable — parent will suppress historyId advance.
+        if (replyTo != null) {
+            replyTo.tell(new EmailFetcherActor.LlmExtractorResult(true));
+        }
         return Behaviors.stopped();
     }
 

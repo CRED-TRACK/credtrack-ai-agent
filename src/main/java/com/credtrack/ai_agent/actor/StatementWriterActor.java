@@ -36,7 +36,7 @@ public class StatementWriterActor extends AbstractBehavior<StatementWriterActor.
             String     makePaymentUrl
     ) implements Command {}
 
-    private record WriteDone(String gmailMessageId) implements Command {}
+    private record WriteDone(String gmailMessageId, boolean isNew) implements Command {}
     private record WriteFailed(String gmailMessageId, String reason) implements Command {}
 
     // ── Factory ───────────────────────────────────────────────────────────────
@@ -64,7 +64,11 @@ public class StatementWriterActor extends AbstractBehavior<StatementWriterActor.
     public Receive<Command> createReceive() {
         return newReceiveBuilder()
                 .onMessage(WriteStatement.class, this::onWrite)
-                .onMessage(WriteDone.class,      msg -> { getContext().getLog().info("Saved: {}", msg.gmailMessageId()); return this; })
+                .onMessage(WriteDone.class,      msg -> {
+                    if (msg.isNew()) getContext().getLog().info("Saved: {}", msg.gmailMessageId());
+                    else            getContext().getLog().debug("Duplicate skipped: {}", msg.gmailMessageId());
+                    return this;
+                })
                 .onMessage(WriteFailed.class,    msg -> { getContext().getLog().error("Save failed {}: {}", msg.gmailMessageId(), msg.reason()); return this; })
                 .build();
     }
@@ -72,16 +76,16 @@ public class StatementWriterActor extends AbstractBehavior<StatementWriterActor.
     private Behavior<Command> onWrite(WriteStatement msg) {
         getContext().pipeToSelf(
                 CompletableFuture.supplyAsync(() -> {
-                    backendApiClient.postStatement(
+                    boolean isNew = backendApiClient.postStatement(
                             msg.userId(), msg.gmailMessageId(), msg.cardLastFour(),
                             msg.bankKey(), msg.statementBalance(), msg.minimumDue(),
                             msg.statementDate(), msg.dueDate(),
                             msg.viewStatementUrl(), msg.makePaymentUrl());
-                    return msg.gmailMessageId();
+                    return isNew;
                 }, executor),
                 (result, ex) -> ex != null
                         ? new WriteFailed(msg.gmailMessageId(), ex.getMessage())
-                        : new WriteDone(result)
+                        : new WriteDone(msg.gmailMessageId(), result)
         );
         return this;
     }

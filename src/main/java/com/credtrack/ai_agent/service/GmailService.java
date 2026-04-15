@@ -1,5 +1,6 @@
 package com.credtrack.ai_agent.service;
 
+import com.credtrack.ai_agent.model.CardInfo;
 import com.credtrack.ai_agent.model.EmailMessage;
 import com.google.api.client.googleapis.javanet.GoogleNetHttpTransport;
 import com.google.api.client.googleapis.json.GoogleJsonResponseException;
@@ -9,7 +10,6 @@ import com.google.api.services.gmail.model.History;
 import com.google.api.services.gmail.model.ListHistoryResponse;
 import com.google.api.services.gmail.model.Message;
 import com.google.api.services.gmail.model.MessagePart;
-import com.google.api.client.http.HttpRequestInitializer;
 import com.google.auth.http.HttpCredentialsAdapter;
 import com.google.auth.oauth2.AccessToken;
 import com.google.auth.oauth2.GoogleCredentials;
@@ -46,194 +46,31 @@ public class GmailService {
             "usbank.com",            "US_BANK"
     );
 
+    // ── Normal poll (pure incremental) ─────────────────────────────────────────
+
     /**
-     * Fetches statement emails for a user using three strategies:
+     * Fetches emails that arrived since the last historyId cursor.
      *
-     * 1. historyId == null (very first poll ever):
-     *    Full historical search for all registered cards.
+     * This is the ONLY method used by the normal poll path (EmailFetcherActor).
+     * It does NOT perform any keyword search — only the Gmail History API is used,
+     * so it is fast and never re-processes old emails.
      *
-     * 2. historyId != null + card has gmailScanComplete=false (new card added after first poll):
-     *    Targeted historical search just for that card's digits, regardless of historyId cursor.
-     *    The card ID is added to completedCardScans so the caller can mark it done.
-     *
-     * 3. historyId != null + card has gmailScanComplete=true + today is within
-     *    [lastStatementDate+1month, lastStatementDate+1month+3days]:
-     *    Targeted safety-net search for that specific card's upcoming statement.
-     *    Catches emails the agent may have missed (e.g. agent was down when the email arrived).
-     *
-     * The incremental historyId poll always runs when historyId != null,
-     * so new emails are caught even without the safety-net search.
+     * If historyId is null (first time after init), the method records the current
+     * historyId as the new cursor and returns an empty list.  All historical emails
+     * are handled by InitCardScanActor, not here.
      */
-    public FetchResult fetchNewEmails(String accessToken, Long historyId,
-                                      List<com.credtrack.ai_agent.model.CardInfo> cards) throws Exception {
+    public FetchResult fetchNewEmails(String accessToken, Long historyId) throws Exception {
         Gmail gmail = buildClient(accessToken);
         List<EmailMessage> emails = new ArrayList<>();
-        Set<Long> completedCardScans = new HashSet<>();
         Long newHistoryId = historyId;
 
         if (historyId == null) {
-            // ── Strategy 1: very first poll — full historical search ──────────
-            String fromClause = "from:(" + String.join(" OR ", SENDER_DOMAIN_TO_BANK.keySet()) + ")";
-
-            // Separate Amex 4-digit cards — Gmail tokenizes "51006" as one token, so
-            // searching "1006" won't find emails that contain "51006". Search Amex
-            // without card digits; the extractor will discover and auto-save the 5-digit value.
-            List<com.credtrack.ai_agent.model.CardInfo> normalCards = cards == null ? List.of() :
-                    cards.stream()
-                            .filter(c -> !("AMEX".equals(c.bankKey()) && c.lastFour().length() == 4))
-                            .toList();
-            List<com.credtrack.ai_agent.model.CardInfo> amex4DigitCards = cards == null ? List.of() :
-                    cards.stream()
-                            .filter(c -> "AMEX".equals(c.bankKey()) && c.lastFour().length() == 4)
-                            .toList();
-
-            // Broad search for all non-Amex cards (and any Amex with 5-digit lastFour)
-            if (!normalCards.isEmpty()) {
-                String cardClause = buildCardClause(normalCards);
-                String query = fromClause + " subject:statement" + cardClause;
-                log.info("First poll Gmail query: {}", query);
-                newHistoryId = searchAndCollect(gmail, query, emails, newHistoryId);
-            }
-
-            // Separate no-digit search per Amex 4-digit card — avoids Gmail tokenization mismatch
-            for (com.credtrack.ai_agent.model.CardInfo amexCard : amex4DigitCards) {
-                String query = "from:americanexpress.com subject:statement";
-                log.info("First poll Amex no-digit search for card {} ({}): {}",
-                        amexCard.cardId(), amexCard.lastFour(), query);
-                searchAndCollect(gmail, query, emails, null);
-            }
-
-            // Also search for bank payment confirmation emails — these have different subjects
-            // and are missed by the subject:statement filter
-            boolean hasChaseCard = cards != null && cards.stream().anyMatch(c -> "CHASE".equals(c.bankKey()));
-            if (hasChaseCard) {
-                String paymentQuery = "from:chase.com (\"payment is scheduled\" OR \"payment scheduled\")";
-                log.info("First poll Chase payment query: {}", paymentQuery);
-                searchAndCollect(gmail, paymentQuery, emails, null);
-            }
-            boolean hasBoaCard = cards != null && cards.stream().anyMatch(c -> "BOA".equals(c.bankKey()));
-            if (hasBoaCard) {
-                String paymentQuery = "from:ealerts.bankofamerica.com \"received your credit card payment\"";
-                log.info("First poll BOA payment query: {}", paymentQuery);
-                searchAndCollect(gmail, paymentQuery, emails, null);
-            }
-            boolean hasDiscoverCard = cards != null && cards.stream().anyMatch(c -> "DISCOVER".equals(c.bankKey()));
-            if (hasDiscoverCard) {
-                String paymentQuery = "from:services.discover.com \"scheduled payment\"";
-                log.info("First poll Discover payment query: {}", paymentQuery);
-                searchAndCollect(gmail, paymentQuery, emails, null);
-            }
-            boolean hasAmexCard = cards != null && cards.stream().anyMatch(c -> "AMEX".equals(c.bankKey()));
-            if (hasAmexCard) {
-                String paymentQuery = "from:welcome.americanexpress.com \"received your payment\"";
-                log.info("First poll Amex payment query: {}", paymentQuery);
-                searchAndCollect(gmail, paymentQuery, emails, null);
-            }
-
-            if (newHistoryId == null) {
-                newHistoryId = gmail.users().getProfile(USER).execute().getHistoryId().longValue();
-            }
-            // All cards scanned — mark them all complete
-            if (cards != null) cards.forEach(c -> completedCardScans.add(c.cardId()));
-
+            // No cursor yet — record current position and return.
+            // Historical scan is handled by InitCardScanActor.
+            newHistoryId = gmail.users().getProfile(USER).execute().getHistoryId().longValue();
+            log.info("No historyId cursor — recording current position: {}", newHistoryId);
         } else {
-            // ── Strategy 2 & 3: targeted searches for individual cards ────────
-            if (cards != null) {
-                for (com.credtrack.ai_agent.model.CardInfo card : cards) {
-                    if (!card.gmailScanComplete()) {
-                        // New card — historical scan.
-                        // Use ONLY this card's bank domain (not all domains) to narrow results,
-                        // and drop card digits because Gmail tokenizes "51006" as one token so
-                        // searching "1006" won't match it as a substring.
-                        // The StatementExtractorActor validates extracted digits against registered
-                        // cards anyway, so non-matching statements are rejected downstream.
-                        String bankDomain = SENDER_DOMAIN_TO_BANK.entrySet().stream()
-                                .filter(e -> e.getValue().equals(card.bankKey()))
-                                .map(Map.Entry::getKey)
-                                .findFirst().orElse(null);
-                        if (bankDomain == null) {
-                            log.warn("No domain mapping for bankKey {} — skipping historical scan for card {}",
-                                    card.bankKey(), card.cardId());
-                            completedCardScans.add(card.cardId());
-                            continue;
-                        }
-                        // If lastFour is 4 digits and this is AMEX, search without digits:
-                        // Amex displays 5 digits (e.g. "51006") so the 4-digit token "1006"
-                        // won't match. The extractor will discover and save the full 5 digits.
-                        // For all other banks (or if 5 digits already stored), include the token.
-                        boolean needsDigitDiscovery = "AMEX".equals(card.bankKey())
-                                && card.lastFour().length() == 4;
-                        String query = needsDigitDiscovery
-                                ? "from:" + bankDomain + " subject:statement"
-                                : "from:" + bankDomain + " subject:statement " + card.lastFour();
-                        log.info("Historical scan for new card {} ({}, {}): {}", card.cardId(), card.lastFour(), card.bankKey(), query);
-                        searchAndCollect(gmail, query, emails, null);
-
-                        // Also fetch payment confirmation emails — not caught by subject:statement filter
-                        if ("CHASE".equals(card.bankKey())) {
-                            String paymentQuery = "from:chase.com (\"payment is scheduled\" OR \"payment scheduled\") " + card.lastFour();
-                            log.info("Historical payment scan for new Chase card {}: {}", card.cardId(), paymentQuery);
-                            searchAndCollect(gmail, paymentQuery, emails, null);
-                        } else if ("BOA".equals(card.bankKey())) {
-                            String paymentQuery = "from:ealerts.bankofamerica.com \"received your credit card payment\" " + card.lastFour();
-                            log.info("Historical payment scan for new BOA card {}: {}", card.cardId(), paymentQuery);
-                            searchAndCollect(gmail, paymentQuery, emails, null);
-                        } else if ("DISCOVER".equals(card.bankKey())) {
-                            String paymentQuery = "from:services.discover.com \"scheduled payment\" " + card.lastFour();
-                            log.info("Historical payment scan for new Discover card {}: {}", card.cardId(), paymentQuery);
-                            searchAndCollect(gmail, paymentQuery, emails, null);
-                        } else if ("AMEX".equals(card.bankKey())) {
-                            String paymentQuery = "from:welcome.americanexpress.com \"received your payment\" " + card.lastFour();
-                            log.info("Historical payment scan for new Amex card {}: {}", card.cardId(), paymentQuery);
-                            searchAndCollect(gmail, paymentQuery, emails, null);
-                        }
-                        completedCardScans.add(card.cardId());
-
-                    } else if (isInStatementWindow(card.lastStatementDate())) {
-                        // Existing card in its expected statement window — safety-net search
-                        java.time.LocalDate windowStart = card.lastStatementDate().plusMonths(1);
-                        java.time.LocalDate windowEnd   = windowStart.plusDays(3);
-                        String bankDomain2 = SENDER_DOMAIN_TO_BANK.entrySet().stream()
-                                .filter(e -> e.getValue().equals(card.bankKey()))
-                                .map(Map.Entry::getKey)
-                                .findFirst().orElse(null);
-                        if (bankDomain2 == null) continue;
-                        String dateRange  = "after:" + windowStart.minusDays(1)
-                                          + " before:" + windowEnd.plusDays(1);
-                        String query = "from:" + bankDomain2 + " subject:statement " + card.lastFour() + " " + dateRange;
-                        log.info("Statement window search for card {} ({}, {}): {}", card.cardId(), card.lastFour(), card.bankKey(), query);
-                        searchAndCollect(gmail, query, emails, null);
-                    }
-                }
-            }
-
-            // ── Strategy 4: Payment catch-up for cards with unpaid statements ────────
-            // For any supported card with hasUnpaidStatements=true, search for payment
-            // confirmation emails that may have been sent before the historyId cursor was set.
-            if (cards != null) {
-                for (com.credtrack.ai_agent.model.CardInfo card : cards) {
-                    if (!card.hasUnpaidStatements()) continue;
-                    if ("CHASE".equals(card.bankKey())) {
-                        String paymentQuery = "from:chase.com (\"payment is scheduled\" OR \"payment scheduled\") " + card.lastFour();
-                        log.info("Chase payment catch-up for card {} ({}): {}", card.cardId(), card.lastFour(), paymentQuery);
-                        searchAndCollect(gmail, paymentQuery, emails, null);
-                    } else if ("BOA".equals(card.bankKey())) {
-                        String paymentQuery = "from:ealerts.bankofamerica.com \"received your credit card payment\" " + card.lastFour();
-                        log.info("BOA payment catch-up for card {} ({}): {}", card.cardId(), card.lastFour(), paymentQuery);
-                        searchAndCollect(gmail, paymentQuery, emails, null);
-                    } else if ("DISCOVER".equals(card.bankKey())) {
-                        String paymentQuery = "from:services.discover.com \"scheduled payment\" " + card.lastFour();
-                        log.info("Discover payment catch-up for card {} ({}): {}", card.cardId(), card.lastFour(), paymentQuery);
-                        searchAndCollect(gmail, paymentQuery, emails, null);
-                    } else if ("AMEX".equals(card.bankKey())) {
-                        String paymentQuery = "from:welcome.americanexpress.com \"received your payment\" " + card.lastFour();
-                        log.info("Amex payment catch-up for card {} ({}): {}", card.cardId(), card.lastFour(), paymentQuery);
-                        searchAndCollect(gmail, paymentQuery, emails, null);
-                    }
-                }
-            }
-
-            // ── Always run incremental poll for new emails since last historyId ─
+            // Incremental: only messages added since the last cursor.
             ListHistoryResponse histResp = gmail.users().history()
                     .list(USER)
                     .setStartHistoryId(BigInteger.valueOf(historyId))
@@ -267,64 +104,91 @@ public class GmailService {
                     : historyId;
         }
 
-        // Deduplicate by messageId (targeted searches may overlap with incremental)
-        Map<String, EmailMessage> seen = new java.util.LinkedHashMap<>();
-        for (EmailMessage e : emails) seen.put(e.messageId(), e);
-
-        List<EmailMessage> bankEmails = seen.values().stream()
+        List<EmailMessage> bankEmails = emails.stream()
                 .filter(e -> resolveBankKey(e.senderDomain()) != null)
                 .toList();
 
-        log.info("Fetched {} unique bank emails, newHistoryId={}, completedScans={}",
-                bankEmails.size(), newHistoryId, completedCardScans);
-
-        return new FetchResult(bankEmails, newHistoryId, completedCardScans);
+        log.info("Incremental poll: {} bank emails, newHistoryId={}", bankEmails.size(), newHistoryId);
+        return new FetchResult(bankEmails, newHistoryId);
     }
 
-    /** Runs a Gmail search query and appends results to {@code emails}. Returns highest historyId seen. */
-    private Long searchAndCollect(Gmail gmail, String query,
-                                  List<EmailMessage> emails, Long currentMax) throws Exception {
-        var listResp = gmail.users().messages()
-                .list(USER)
-                .setMaxResults(50L)
-                .setQ(query)
-                .execute();
+    // ── Init scan (one-shot historical search, called by InitCardScanActor) ───
 
-        if (listResp.getMessages() == null) return currentMax;
-
-        for (var ref : listResp.getMessages()) {
-            Message msg = gmail.users().messages()
-                    .get(USER, ref.getId())
-                    .setFormat("full")
-                    .execute();
-            toEmailMessage(msg).ifPresent(emails::add);
-            if (msg.getHistoryId() != null) {
-                long hid = msg.getHistoryId().longValue();
-                if (currentMax == null || hid > currentMax) currentMax = hid;
-            }
+    /**
+     * Searches Gmail for all historical statement emails for a single card.
+     * Called by InitCardScanActor during the one-time init scan for a new card.
+     *
+     * Uses Gmail search API (keyword-based), not the History API.
+     * AMEX 4-digit cards omit card digits because Gmail tokenizes "51006" as a
+     * single token — searching "1006" would miss those emails.  StatementExtractorActor
+     * discovers and persists the 5-digit value automatically.
+     */
+    public List<EmailMessage> searchStatementEmailsForCard(String accessToken, CardInfo card)
+            throws Exception {
+        String bankDomain = getBankDomain(card.bankKey());
+        if (bankDomain == null) {
+            log.warn("No domain mapping for bankKey {} — skipping statement search for card {}",
+                    card.bankKey(), card.cardId());
+            return List.of();
         }
-        return currentMax;
+        boolean needsDigitDiscovery = "AMEX".equals(card.bankKey()) && card.lastFour().length() == 4;
+        String query = needsDigitDiscovery
+                ? "from:" + bankDomain + " subject:statement"
+                : "from:" + bankDomain + " subject:statement " + card.lastFour();
+        log.info("Init statement search for card {} ({}, {}): {}",
+                card.cardId(), card.lastFour(), card.bankKey(), query);
+
+        Gmail gmail = buildClient(accessToken);
+        List<EmailMessage> emails = new ArrayList<>();
+        searchAndCollect(gmail, query, emails);
+        return emails;
     }
 
-    /** Returns true if today falls in [lastStatementDate+1month, lastStatementDate+1month+3days]. */
-    private boolean isInStatementWindow(java.time.LocalDate lastStatementDate) {
-        if (lastStatementDate == null) return false;
-        java.time.LocalDate windowStart = lastStatementDate.plusMonths(1);
-        java.time.LocalDate windowEnd   = windowStart.plusDays(3);
-        java.time.LocalDate today       = java.time.LocalDate.now(ZoneOffset.UTC);
-        return !today.isBefore(windowStart) && !today.isAfter(windowEnd);
+    /**
+     * Searches Gmail for all historical payment confirmation emails for a single card.
+     * Called by InitCardScanActor after the statement phase completes.
+     *
+     * All payment emails are searched without date filter — the backend's
+     * gmailMessageId uniqueness constraint makes duplicate posts idempotent.
+     */
+    public List<EmailMessage> searchPaymentEmailsForCard(String accessToken, CardInfo card)
+            throws Exception {
+        Gmail gmail = buildClient(accessToken);
+        List<EmailMessage> emails = new ArrayList<>();
+        String lastFour = card.lastFour();
+
+        switch (card.bankKey()) {
+            case "CHASE" -> {
+                String q = "from:chase.com (\"payment is scheduled\" OR \"payment scheduled\") " + lastFour;
+                log.info("Init payment search for Chase card {}: {}", card.cardId(), q);
+                searchAndCollect(gmail, q, emails);
+            }
+            case "BOA" -> {
+                String q = "from:ealerts.bankofamerica.com \"received your credit card payment\" " + lastFour;
+                log.info("Init payment search for BOA card {}: {}", card.cardId(), q);
+                searchAndCollect(gmail, q, emails);
+            }
+            case "DISCOVER" -> {
+                String q = "from:services.discover.com \"scheduled payment\" " + lastFour;
+                log.info("Init payment search for Discover card {}: {}", card.cardId(), q);
+                searchAndCollect(gmail, q, emails);
+            }
+            case "AMEX" -> {
+                // 4-digit stored lastFour: omit digits — Gmail tokenizes "51006" as one token
+                // so searching "1006" won't match. PaymentExtractorActor validates digits anyway.
+                boolean noDigit = card.lastFour().length() == 4;
+                String q = noDigit
+                        ? "from:welcome.americanexpress.com \"received your payment\""
+                        : "from:welcome.americanexpress.com \"received your payment\" " + lastFour;
+                log.info("Init payment search for Amex card {}: {}", card.cardId(), q);
+                searchAndCollect(gmail, q, emails);
+            }
+            default -> log.debug("No payment search configured for bankKey {}", card.bankKey());
+        }
+        return emails;
     }
 
-    /** Builds " (\"1234\" OR \"5678\")" clause from card list. Empty string if no cards. */
-    private String buildCardClause(List<com.credtrack.ai_agent.model.CardInfo> cards) {
-        if (cards == null || cards.isEmpty()) return "";
-        // Quoted — exact match needed for broad first-poll to avoid false positives
-        // across all banks + subject:statement filter.
-        String digits = cards.stream()
-                .map(c -> "\"" + c.lastFour() + "\"")
-                .collect(java.util.stream.Collectors.joining(" OR "));
-        return " (" + digits + ")";
-    }
+    // ── Helpers ────────────────────────────────────────────────────────────────
 
     /**
      * Returns the bankKey for a sender domain, or null if not a known bank.
@@ -338,7 +202,32 @@ public class GmailService {
         return null;
     }
 
-    // ── Private helpers ────────────────────────────────────────────────────────
+    /** Returns the sender domain for a given bankKey, or null if unknown. */
+    private String getBankDomain(String bankKey) {
+        return SENDER_DOMAIN_TO_BANK.entrySet().stream()
+                .filter(e -> e.getValue().equals(bankKey))
+                .map(Map.Entry::getKey)
+                .findFirst().orElse(null);
+    }
+
+    /** Runs a Gmail search query and appends matching emails to {@code out}. */
+    private void searchAndCollect(Gmail gmail, String query, List<EmailMessage> out) throws Exception {
+        var listResp = gmail.users().messages()
+                .list(USER)
+                .setMaxResults(50L)
+                .setQ(query)
+                .execute();
+
+        if (listResp.getMessages() == null) return;
+
+        for (var ref : listResp.getMessages()) {
+            Message msg = gmail.users().messages()
+                    .get(USER, ref.getId())
+                    .setFormat("full")
+                    .execute();
+            toEmailMessage(msg).ifPresent(out::add);
+        }
+    }
 
     private Gmail buildClient(String accessToken) throws Exception {
         AccessToken token = new AccessToken(accessToken, new Date(Long.MAX_VALUE));
@@ -375,7 +264,7 @@ public class GmailService {
 
         String body = extractBody(msg.getPayload());
 
-        // internalDate is epoch-millis in UTC — this is the statement closing date
+        // internalDate is epoch-millis in UTC
         LocalDate sentDate = msg.getInternalDate() != null
                 ? Instant.ofEpochMilli(msg.getInternalDate()).atZone(ZoneOffset.UTC).toLocalDate()
                 : null;
@@ -406,12 +295,10 @@ public class GmailService {
     }
 
     private String extractDomain(String fromHeader) {
-        // From header: "Chase <no.reply.alerts@chase.com>" or "alerts@chase.com"
         if (fromHeader == null) return "";
         int at = fromHeader.lastIndexOf('@');
         if (at < 0) return "";
         String rest = fromHeader.substring(at + 1);
-        // Strip trailing ">" if present
         int angle = rest.indexOf('>');
         return angle >= 0 ? rest.substring(0, angle).trim() : rest.trim();
     }
@@ -446,5 +333,5 @@ public class GmailService {
         }
     }
 
-    public record FetchResult(List<EmailMessage> emails, Long newHistoryId, Set<Long> completedCardScans) {}
+    public record FetchResult(List<EmailMessage> emails, Long newHistoryId) {}
 }
