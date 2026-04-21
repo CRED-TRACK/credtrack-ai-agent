@@ -207,6 +207,74 @@ public class BackendApiClient {
     }
 
     /**
+     * Posts an extracted transaction to the backend.
+     * POST /internal/transactions — 201 on success, 409 on duplicate gmailMessageId.
+     */
+    public void postTransaction(String userId,
+                                String gmailMessageId,
+                                String cardLastFour,
+                                String bankKey,
+                                String merchantName,
+                                String merchantCategory,
+                                java.math.BigDecimal amount,
+                                String currency,
+                                LocalDate transactionDate,
+                                String transactionType,
+                                String description,
+                                double confidence) {
+        try {
+            Map<String, Object> body = new HashMap<>();
+            body.put("user_id",          userId);
+            body.put("gmail_message_id", gmailMessageId);
+            body.put("card_last_four",   cardLastFour);
+            body.put("bank_key",         bankKey);
+            body.put("merchant_name",    merchantName);
+            body.put("merchant_category", merchantCategory);
+            body.put("amount",           amount);
+            body.put("currency",         currency != null ? currency : "USD");
+            body.put("transaction_date", transactionDate != null ? transactionDate.toString() : null);
+            body.put("transaction_type", transactionType);
+            body.put("status",           "PENDING");
+            body.put("description",      description);
+            body.put("llm_confidence",   String.valueOf(confidence));
+
+            webClient.post()
+                    .uri("/internal/transactions")
+                    .bodyValue(body)
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block();
+
+            log.info("Transaction saved: {} for user {} amount={}", gmailMessageId, userId, amount);
+        } catch (Exception e) {
+            if (e.getMessage() != null && e.getMessage().contains("409")) {
+                log.debug("Duplicate transaction skipped: {}", gmailMessageId);
+            } else {
+                log.error("Failed to save transaction {}: {}", gmailMessageId, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Records the current timestamp as the last transaction scan time for a card.
+     * PATCH /internal/cards/{cardId}/transaction-scan
+     * The coordinator uses this timestamp to decide whether to run a scan again
+     * (controlled by TRANSACTION_SCAN_INTERVAL_MINUTES env var, default 1440 = 1 day).
+     */
+    public void updateLastTransactionScanAt(Long cardId) {
+        try {
+            webClient.patch()
+                    .uri("/internal/cards/{cardId}/transaction-scan", cardId)
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block();
+            log.info("Transaction scan timestamp updated for card {}", cardId);
+        } catch (Exception e) {
+            log.error("Failed to update transaction scan timestamp for card {}: {}", cardId, e.getMessage());
+        }
+    }
+
+    /**
      * Updates the Gmail historyId cursor after a successful poll cycle.
      * PATCH /internal/gmail-credentials/{userId}
      */
@@ -227,5 +295,25 @@ public class BackendApiClient {
         } catch (Exception e) {
             log.error("Failed to update historyId for user {}: {}", userId, e.getMessage());
         }
+    }
+
+    /**
+     * Sums the amount of all transactions for a card after the given date.
+     * Calls GET /statements/unbilled?cardId={id} and returns the unbilledTotal field.
+     */
+    public double getUnbilledTotal(String userId, Long userCardId, LocalDate since) {
+        try {
+            Map<?, ?> response = webClient.get()
+                    .uri("/statements/unbilled?cardId=" + userCardId)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .block();
+            if (response != null && response.get("unbilledTotal") instanceof Number n) {
+                return n.doubleValue();
+            }
+        } catch (Exception e) {
+            log.warn("getUnbilledTotal failed for card {}: {}", userCardId, e.getMessage());
+        }
+        return 0.0;
     }
 }

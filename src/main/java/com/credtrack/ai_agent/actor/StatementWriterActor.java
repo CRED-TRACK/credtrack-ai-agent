@@ -1,5 +1,6 @@
 package com.credtrack.ai_agent.actor;
 
+import akka.actor.typed.ActorRef;
 import akka.actor.typed.Behavior;
 import akka.actor.typed.javadsl.AbstractBehavior;
 import akka.actor.typed.javadsl.ActorContext;
@@ -33,29 +34,35 @@ public class StatementWriterActor extends AbstractBehavior<StatementWriterActor.
             LocalDate  statementDate,
             LocalDate  dueDate,
             String     viewStatementUrl,
-            String     makePaymentUrl
+            String     makePaymentUrl,
+            Long       userCardId        // nullable — used to notify the ledger after a successful write
     ) implements Command {}
 
-    private record WriteDone(String gmailMessageId, boolean isNew) implements Command {}
+    private record WriteDone(String gmailMessageId, boolean isNew, WriteStatement original) implements Command {}
     private record WriteFailed(String gmailMessageId, String reason) implements Command {}
 
     // ── Factory ───────────────────────────────────────────────────────────────
 
-    public static Behavior<Command> create(BackendApiClient backendApiClient, Executor executor) {
-        return Behaviors.setup(ctx -> new StatementWriterActor(ctx, backendApiClient, executor));
+    public static Behavior<Command> create(BackendApiClient backendApiClient,
+                                           Executor executor,
+                                           ActorRef<PersistentStatementLedgerActor.Command> ledger) {
+        return Behaviors.setup(ctx -> new StatementWriterActor(ctx, backendApiClient, executor, ledger));
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
 
     private final BackendApiClient backendApiClient;
     private final Executor         executor;
+    private final ActorRef<PersistentStatementLedgerActor.Command> ledger;
 
     private StatementWriterActor(ActorContext<Command> context,
                                  BackendApiClient backendApiClient,
-                                 Executor executor) {
+                                 Executor executor,
+                                 ActorRef<PersistentStatementLedgerActor.Command> ledger) {
         super(context);
         this.backendApiClient = backendApiClient;
         this.executor         = executor;
+        this.ledger           = ledger;
     }
 
     // ── Behavior ──────────────────────────────────────────────────────────────
@@ -65,8 +72,17 @@ public class StatementWriterActor extends AbstractBehavior<StatementWriterActor.
         return newReceiveBuilder()
                 .onMessage(WriteStatement.class, this::onWrite)
                 .onMessage(WriteDone.class,      msg -> {
-                    if (msg.isNew()) getContext().getLog().info("Saved: {}", msg.gmailMessageId());
-                    else            getContext().getLog().debug("Duplicate skipped: {}", msg.gmailMessageId());
+                    if (msg.isNew()) {
+                        getContext().getLog().info("Saved: {}", msg.gmailMessageId());
+                        // Notify the persistent ledger so unbilled-spend queries have an up-to-date closing date
+                        WriteStatement orig = msg.original();
+                        if (orig.userCardId() != null && orig.statementDate() != null) {
+                            ledger.tell(new PersistentStatementLedgerActor.RecordStatementClosed(
+                                    orig.userId(), orig.userCardId(), orig.statementDate()));
+                        }
+                    } else {
+                        getContext().getLog().debug("Duplicate skipped: {}", msg.gmailMessageId());
+                    }
                     return this;
                 })
                 .onMessage(WriteFailed.class,    msg -> { getContext().getLog().error("Save failed {}: {}", msg.gmailMessageId(), msg.reason()); return this; })
@@ -85,7 +101,7 @@ public class StatementWriterActor extends AbstractBehavior<StatementWriterActor.
                 }, executor),
                 (result, ex) -> ex != null
                         ? new WriteFailed(msg.gmailMessageId(), ex.getMessage())
-                        : new WriteDone(msg.gmailMessageId(), result)
+                        : new WriteDone(msg.gmailMessageId(), result, msg)
         );
         return this;
     }

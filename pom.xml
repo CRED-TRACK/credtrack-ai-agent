@@ -63,6 +63,17 @@
 			<artifactId>akka-slf4j_2.13</artifactId>
 			<version>2.6.21</version>
 		</dependency>
+		<dependency>
+			<groupId>com.typesafe.akka</groupId>
+			<artifactId>akka-persistence-typed_2.13</artifactId>
+			<version>2.6.21</version>
+		</dependency>
+		<!-- In-memory journal for Akka Persistence (demo/dev) -->
+		<dependency>
+			<groupId>com.typesafe.akka</groupId>
+			<artifactId>akka-persistence-testkit_2.13</artifactId>
+			<version>2.6.21</version>
+		</dependency>
 
 		<!-- Gmail API -->
 		<dependency>

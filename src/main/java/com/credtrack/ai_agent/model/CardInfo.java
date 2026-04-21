@@ -9,7 +9,8 @@ import java.time.LocalDate;
 public record CardInfo(
         Long      cardId,
         String    lastFour,
-        String    bankKey,             // CHASE | AMEX | BOA | DISCOVER | CITI | CAPITAL_ONE | WELLS_FARGO | US_BANK
-        boolean   gmailScanComplete,  // false = one-time init scan has not yet run for this card
-        LocalDate lastStatementDate   // date of most recent saved statement (null if none)
+        String    bankKey,                 // CHASE | AMEX | BOA | DISCOVER | CITI | CAPITAL_ONE | WELLS_FARGO | US_BANK
+        boolean   gmailScanComplete,      // false = one-time init scan has not yet run for this card
+        LocalDate lastStatementDate,      // date of most recent saved statement (null if none)
+        String    lastTransactionScanAt   // ISO datetime of last transaction scan (null = never scanned)
 ) {}
