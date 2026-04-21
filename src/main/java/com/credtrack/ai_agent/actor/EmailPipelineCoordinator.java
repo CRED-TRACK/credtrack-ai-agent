@@ -2,10 +2,13 @@ package com.credtrack.ai_agent.actor;
 
 import akka.actor.typed.ActorRef;
 import akka.actor.typed.Behavior;
+import akka.actor.typed.SupervisorStrategy;
 import akka.actor.typed.javadsl.AbstractBehavior;
 import akka.actor.typed.javadsl.ActorContext;
 import akka.actor.typed.javadsl.Behaviors;
 import akka.actor.typed.javadsl.Receive;
+
+import java.time.Duration;
 import com.credtrack.ai_agent.model.CardInfo;
 import com.credtrack.ai_agent.model.GmailUserCredential;
 import com.credtrack.ai_agent.service.BackendApiClient;
@@ -15,8 +18,10 @@ import com.credtrack.ai_agent.service.GmailService;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -66,6 +71,9 @@ public class EmailPipelineCoordinator extends AbstractBehavior<EmailPipelineCoor
     /** Sent by InitCardScanActor when the init scan fails (e.g. LLM unavailable). */
     public record InitScanFailed(String userId) implements Command {}
 
+    /** Sent by TransactionInitActor when the post-init transaction backfill finishes. */
+    public record TransactionBackfillComplete(String userId) implements Command {}
+
     private record CredentialsFetched(List<GmailUserCredential> credentials) implements Command {}
     private record CredentialsFetchFailed(String reason)                     implements Command {}
 
@@ -74,9 +82,13 @@ public class EmailPipelineCoordinator extends AbstractBehavior<EmailPipelineCoor
     public static Behavior<Command> create(BackendApiClient backendApiClient,
                                            GmailService gmailService,
                                            ExtractionService extractionService,
-                                           Executor executor) {
+                                           Executor executor,
+                                           ActorRef<PersistentStatementLedgerActor.Command> ledger,
+                                           ActorRef<AnalyticsAgentHolder.Command> agentHolder,
+                                           long transactionScanIntervalMinutes) {
         return Behaviors.setup(ctx ->
-                new EmailPipelineCoordinator(ctx, backendApiClient, gmailService, extractionService, executor));
+                new EmailPipelineCoordinator(ctx, backendApiClient, gmailService, extractionService,
+                        executor, ledger, agentHolder, transactionScanIntervalMinutes));
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -89,6 +101,12 @@ public class EmailPipelineCoordinator extends AbstractBehavior<EmailPipelineCoor
     /** Singleton statement writer shared across all fetch workers. */
     private final ActorRef<StatementWriterActor.Command> writer;
 
+    /** Analytics agent holder — updated after each unbilled spend computation. */
+    private final ActorRef<AnalyticsAgentHolder.Command> agentHolder;
+
+    /** Ledger ref — used here to seed from backend data on credentials fetch. */
+    private final ActorRef<PersistentStatementLedgerActor.Command> statementLedger;
+
     /**
      * Users currently undergoing a one-time init scan.
      * Normal polling is suppressed for these users until init completes or fails.
@@ -96,18 +114,33 @@ public class EmailPipelineCoordinator extends AbstractBehavior<EmailPipelineCoor
      */
     private final Set<String> activeUsers = new HashSet<>();
 
+    /**
+     * Last fetched credentials per userId, used to spawn TransactionInitActor
+     * immediately after init scan completes (without re-fetching from backend).
+     */
+    private final Map<String, GmailUserCredential> lastCredentials = new HashMap<>();
+
+    /** Configurable interval — default 1440 min (24h), set to 5 for testing. */
+    private final long transactionScanIntervalMinutes;
+
     private EmailPipelineCoordinator(ActorContext<Command> context,
                                      BackendApiClient backendApiClient,
                                      GmailService gmailService,
                                      ExtractionService extractionService,
-                                     Executor executor) {
+                                     Executor executor,
+                                     ActorRef<PersistentStatementLedgerActor.Command> ledger,
+                                     ActorRef<AnalyticsAgentHolder.Command> agentHolder,
+                                     long transactionScanIntervalMinutes) {
         super(context);
         this.backendApiClient  = backendApiClient;
         this.gmailService      = gmailService;
         this.extractionService = extractionService;
         this.executor          = executor;
+        this.statementLedger               = ledger;
+        this.agentHolder                   = agentHolder;
+        this.transactionScanIntervalMinutes = transactionScanIntervalMinutes;
         this.writer = context.spawn(
-                StatementWriterActor.create(backendApiClient, executor), "statement-writer");
+                StatementWriterActor.create(backendApiClient, executor, ledger), "statement-writer");
     }
 
     // ── Behavior ──────────────────────────────────────────────────────────────
@@ -115,13 +148,14 @@ public class EmailPipelineCoordinator extends AbstractBehavior<EmailPipelineCoor
     @Override
     public Receive<Command> createReceive() {
         return newReceiveBuilder()
-                .onMessageEquals(Poll.INSTANCE,          this::onPoll)
-                .onMessage(CredentialsFetched.class,     this::onCredentialsFetched)
-                .onMessage(CredentialsFetchFailed.class, this::onCredentialsFetchFailed)
-                .onMessage(FetchComplete.class,          this::onFetchComplete)
-                .onMessage(FetchFailed.class,            this::onFetchFailed)
-                .onMessage(InitScanComplete.class,       this::onInitScanComplete)
-                .onMessage(InitScanFailed.class,         this::onInitScanFailed)
+                .onMessageEquals(Poll.INSTANCE,                  this::onPoll)
+                .onMessage(CredentialsFetched.class,             this::onCredentialsFetched)
+                .onMessage(CredentialsFetchFailed.class,         this::onCredentialsFetchFailed)
+                .onMessage(FetchComplete.class,                  this::onFetchComplete)
+                .onMessage(FetchFailed.class,                    this::onFetchFailed)
+                .onMessage(InitScanComplete.class,               this::onInitScanComplete)
+                .onMessage(InitScanFailed.class,                 this::onInitScanFailed)
+                .onMessage(TransactionBackfillComplete.class,    this::onTransactionBackfillComplete)
                 .build();
     }
 
@@ -141,6 +175,53 @@ public class EmailPipelineCoordinator extends AbstractBehavior<EmailPipelineCoor
     private Behavior<Command> onCredentialsFetched(CredentialsFetched msg) {
         List<GmailUserCredential> credentials = msg.credentials();
         getContext().getLog().info("Starting pipeline for {} Gmail users", credentials.size());
+
+        // ── Seed the in-memory ledger from backend data ────────────────────────
+        // The journal is in-memory and resets on restart; re-seeding each poll
+        // cycle from the backend's CardInfo.lastStatementDate keeps the ledger
+        // consistent with the source of truth (the CardStatement table).
+        // RecordStatementClosed is idempotent — it only updates if newer.
+        for (GmailUserCredential cred : credentials) {
+            lastCredentials.put(cred.getUserId(), cred);
+            if (cred.getCards() != null) {
+                for (CardInfo card : cred.getCards()) {
+                    if (card.lastStatementDate() != null) {
+                        statementLedger.tell(new PersistentStatementLedgerActor.RecordStatementClosed(
+                                cred.getUserId(), card.cardId(), card.lastStatementDate()));
+                    }
+                }
+            }
+        }
+
+        // ── Transaction scan for already-initialised users ─────────────────────
+        // Run if all cards are initialised AND at least one card's lastTransactionScanAt
+        // is null or older than the configured interval.
+        // The interval (default 24h, TRANSACTION_SCAN_INTERVAL_MINUTES=5 for testing)
+        // prevents unnecessary Gmail API calls on every poll cycle.
+        java.time.LocalDateTime cutoff =
+                java.time.LocalDateTime.now().minusMinutes(transactionScanIntervalMinutes);
+
+        for (GmailUserCredential cred : credentials) {
+            String userId = cred.getUserId();
+            if (activeUsers.contains(userId)) continue;
+            if (cred.getCards() == null || cred.getCards().isEmpty()) continue;
+            boolean allInitialised = cred.getCards().stream().allMatch(CardInfo::gmailScanComplete);
+            if (!allInitialised) continue;
+
+            boolean anyCardNeedsScan = cred.getCards().stream().anyMatch(card ->
+                    needsTransactionScan(card.lastTransactionScanAt(), cutoff));
+            if (!anyCardNeedsScan) continue;
+
+            getContext().getLog().info(
+                    "Triggering transaction scan for user {} (interval={}min)",
+                    userId, transactionScanIntervalMinutes);
+            ActorRef<TransactionInitActor.Command> transInit =
+                    getContext().spawnAnonymous(
+                            TransactionInitActor.create(gmailService, backendApiClient, extractionService, executor,
+                                    transactionScanIntervalMinutes));
+            transInit.tell(new TransactionInitActor.RunTransactionBackfill(
+                    userId, cred.getAccessToken(), cred.getCards(), getContext().getSelf()));
+        }
 
         for (GmailUserCredential cred : credentials) {
             String userId = cred.getUserId();
@@ -223,9 +304,31 @@ public class EmailPipelineCoordinator extends AbstractBehavior<EmailPipelineCoor
     }
 
     private Behavior<Command> onInitScanComplete(InitScanComplete msg) {
-        getContext().getLog().info("Init scan complete for user {} — resuming normal poll next cycle",
-                msg.userId());
+        getContext().getLog().info(
+                "Init scan complete for user {} — spawning transaction backfill, " +
+                "normal poll resumes next cycle", msg.userId());
         activeUsers.remove(msg.userId());
+
+        // ── Post-init transaction backfill ────────────────────────────────────
+        // Now that all cards are historically scanned for statements + payments,
+        // kick off a one-time transaction email backfill covering the last 2 cycles.
+        GmailUserCredential cred = lastCredentials.get(msg.userId());
+        if (cred != null && cred.getCards() != null && !cred.getCards().isEmpty()) {
+            ActorRef<TransactionInitActor.Command> transInit =
+                    getContext().spawnAnonymous(
+                            TransactionInitActor.create(gmailService, backendApiClient, extractionService, executor,
+                                    transactionScanIntervalMinutes));
+            transInit.tell(new TransactionInitActor.RunTransactionBackfill(
+                    msg.userId(),
+                    cred.getAccessToken(),
+                    cred.getCards(),
+                    getContext().getSelf()));
+        }
+        return this;
+    }
+
+    private Behavior<Command> onTransactionBackfillComplete(TransactionBackfillComplete msg) {
+        getContext().getLog().info("Transaction backfill complete for user {}", msg.userId());
         return this;
     }
 
@@ -238,6 +341,22 @@ public class EmailPipelineCoordinator extends AbstractBehavior<EmailPipelineCoor
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Returns true if the card needs a transaction scan:
+     *   - Never scanned (lastScanAt is null), OR
+     *   - Last scan was before the cutoff (now - interval).
+     */
+    private boolean needsTransactionScan(String lastScanAt, java.time.LocalDateTime cutoff) {
+        if (lastScanAt == null) return true;
+        try {
+            java.time.LocalDateTime last = java.time.LocalDateTime.parse(lastScanAt,
+                    java.time.format.DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+            return last.isBefore(cutoff);
+        } catch (Exception e) {
+            return true; // unparseable → treat as never scanned
+        }
+    }
 
     /**
      * Returns true if the token is null, already expired, or expires within 5 minutes.

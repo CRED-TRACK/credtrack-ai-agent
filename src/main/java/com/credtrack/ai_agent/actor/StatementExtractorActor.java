@@ -179,7 +179,8 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
                 statementDate,
                 parseDate(ex.getDueDate()),
                 viewUrl,
-                payUrl
+                payUrl,
+                matchedCard.cardId()   // passed to ledger for unbilled-spend tracking
         ));
 
         // LLM responded and data was forwarded for writing — success.

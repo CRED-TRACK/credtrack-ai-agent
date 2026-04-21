@@ -1,6 +1,8 @@
 package com.credtrack.ai_agent.service;
 
 import com.credtrack.ai_agent.model.StatementExtraction;
+import com.credtrack.ai_agent.model.TransactionExtraction;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.jsoup.Jsoup;
@@ -9,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -53,9 +56,7 @@ public class ExtractionService {
      */
     public StatementExtraction extract(String bankKey, String emailBody) {
         String cleanBody = prepareBody(emailBody);
-        log.info("Extraction input for bank {} ({} chars): [{}]",
-                bankKey, cleanBody.length(),
-                cleanBody.length() > 800 ? cleanBody.substring(0, 800) + "..." : cleanBody);
+        log.info("Statement extraction input for bank {} ({} chars)", bankKey, cleanBody.length());
 
         String prompt = """
                 You are a JSON-only financial data extractor. Respond with ONLY a valid JSON object — no explanations, no markdown, no code blocks.
@@ -109,6 +110,93 @@ public class ExtractionService {
             failed.setConfidence(0.0);
             return failed;
         }
+    }
+
+    /**
+     * Extracts transaction data from a bank transaction alert email using the LLM.
+     *
+     * @param bankKey   resolved from sender domain (e.g. "CHASE")
+     * @param emailBody raw email text (may be HTML)
+     * @return TransactionExtraction — check isTransaction + confidence before using
+     */
+    public TransactionExtraction extractTransaction(String bankKey, String emailBody) {
+        String cleanBody = prepareBody(emailBody);
+        log.info("Transaction extraction input for bank {} ({} chars)", bankKey, cleanBody.length());
+
+        String prompt = """
+                You are a JSON-only financial data extractor. Respond with ONLY a valid JSON object — no explanations, no markdown, no code blocks.
+
+                Bank: %s
+
+                A transaction alert email notifies the user of a single debit or credit on their credit card account.
+                Examples: "You made a $86.67 transaction at IC* COSTCO BY INSTAC", "A $120.46 charge was made at AMAZON", "A credit of $40.00 was posted".
+
+                If this is NOT a transaction alert (statement ready, payment scheduled, credit limit change, promotional offer, security alert, etc.), respond with exactly:
+                {"isTransaction":false,"merchantName":null,"merchantCategory":null,"amount":0.0,"currency":"USD","transactionDate":null,"transactionType":"DEBIT","description":null,"confidence":0.0}
+
+                If it IS a transaction alert, extract:
+                - isTransaction: true
+                - merchantName: the merchant name exactly as shown (e.g. "IC* COSTCO BY INSTAC"), null if not found
+                - merchantCategory: one of [dining, travel, grocery, gas, entertainment, shopping, health, utilities, payment, other] — infer from merchant name if not explicit, null if unknown
+                - amount: transaction amount as a number (no $ symbol), 0.0 if not found
+                - currency: currency code, default "USD"
+                - transactionDate: date of transaction in YYYY-MM-DD format, null if not found
+                - transactionType: "CREDIT" if money is coming back to the card (refund, cashback, payment), "DEBIT" for purchases/charges
+                - description: any extra context (optional, usually null)
+                - confidence: 0.0–1.0, use 0.90+ when merchant and amount are clearly present
+
+                Email:
+                %s
+
+                JSON response:
+                """.formatted(bankKey, cleanBody);
+
+        try {
+            String raw = chatClient.prompt()
+                    .user(prompt)
+                    .call()
+                    .content();
+
+            log.info("LLM transaction response for bank {}: {}", bankKey, raw);
+
+            String json = extractJson(raw);
+            TransactionDto dto = MAPPER.readValue(json, TransactionDto.class);
+
+            LocalDate txDate = null;
+            if (dto.transactionDate != null && !dto.transactionDate.isBlank()) {
+                try { txDate = LocalDate.parse(dto.transactionDate); } catch (Exception ignored) {}
+            }
+
+            return new TransactionExtraction(
+                    dto.isTransaction,
+                    dto.merchantName,
+                    dto.merchantCategory,
+                    dto.amount,
+                    dto.currency != null ? dto.currency : "USD",
+                    txDate,
+                    dto.transactionType != null ? dto.transactionType : "DEBIT",
+                    dto.description,
+                    dto.confidence
+            );
+
+        } catch (Exception e) {
+            log.error("LLM transaction extraction failed for bank {}: {}", bankKey, e.getMessage());
+            return new TransactionExtraction(false, null, null, 0.0, "USD", null, "DEBIT", null, 0.0);
+        }
+    }
+
+    /** Private DTO for deserializing the LLM's transaction JSON response. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static class TransactionDto {
+        public boolean isTransaction;
+        public String  merchantName;
+        public String  merchantCategory;
+        public double  amount;
+        public String  currency;
+        public String  transactionDate;   // YYYY-MM-DD string from LLM
+        public String  transactionType;
+        public String  description;
+        public double  confidence;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

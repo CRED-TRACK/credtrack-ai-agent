@@ -188,6 +188,72 @@ public class GmailService {
         return emails;
     }
 
+    // ── Transaction search (called by TransactionInitActor) ───────────────────
+
+    /**
+     * Searches Gmail for transaction alert emails for a single card within a date range.
+     * Called by TransactionInitActor during the post-init transaction backfill.
+     *
+     * Covers banks that send per-transaction alert emails (Chase, BOA, etc.).
+     * Amex is excluded — it sends weekly spending summaries, not per-transaction alerts.
+     *
+     * @param from inclusive start date
+     * @param to   exclusive end date
+     */
+    public List<EmailMessage> searchTransactionEmailsForCard(String accessToken,
+                                                              CardInfo card,
+                                                              LocalDate from,
+                                                              LocalDate to) throws Exception {
+        String query = buildTransactionQuery(card, from, to);
+        if (query == null) {
+            log.debug("No transaction search query for bankKey {} — skipping", card.bankKey());
+            return List.of();
+        }
+
+        log.info("Transaction search for card {} ({} {}): {}", card.cardId(), card.lastFour(), card.bankKey(), query);
+        Gmail gmail = buildClient(accessToken);
+        List<EmailMessage> emails = new ArrayList<>();
+        searchAndCollect(gmail, query, emails);
+        return emails;
+    }
+
+    private String buildTransactionQuery(CardInfo card, LocalDate from, LocalDate to) {
+        // Gmail date format: YYYY/MM/DD
+        String after  = from.getYear() + "/" + String.format("%02d", from.getMonthValue())
+                + "/" + String.format("%02d", from.getDayOfMonth());
+        String before = to.getYear()   + "/" + String.format("%02d", to.getMonthValue())
+                + "/" + String.format("%02d", to.getDayOfMonth());
+        String lastFour = card.lastFour();
+
+        return switch (card.bankKey()) {
+            case "CHASE" ->
+                "from:alerts.chase.com (subject:transaction OR subject:charge OR subject:\"credit was\") "
+                        + lastFour + " after:" + after + " before:" + before;
+            case "BOA" ->
+                // Narrow subject filter: "credit" alone matches "credit line increase" notifications.
+                // BOA transaction alerts say "A charge was made" / "A credit was posted".
+                "from:ealerts.bankofamerica.com (subject:transaction OR subject:charge OR subject:\"credit was\") "
+                        + lastFour + " after:" + after + " before:" + before;
+            case "DISCOVER" ->
+                "from:discover.com (subject:transaction OR subject:charge OR subject:credit) "
+                        + lastFour + " after:" + after + " before:" + before;
+            case "CITI" ->
+                "from:citibank.com (subject:transaction OR subject:charge OR subject:credit) "
+                        + lastFour + " after:" + after + " before:" + before;
+            case "CAPITAL_ONE" ->
+                "from:capitalone.com (subject:transaction OR subject:purchase OR subject:charge) "
+                        + lastFour + " after:" + after + " before:" + before;
+            case "WELLS_FARGO" ->
+                "from:wellsfargo.com (subject:transaction OR subject:charge OR subject:debit) "
+                        + lastFour + " after:" + after + " before:" + before;
+            case "US_BANK" ->
+                "from:usbank.com (subject:transaction OR subject:charge OR subject:debit) "
+                        + lastFour + " after:" + after + " before:" + before;
+            // AMEX sends weekly snapshots, not per-transaction alerts — skip
+            default -> null;
+        };
+    }
+
     // ── Helpers ────────────────────────────────────────────────────────────────
 
     /**
