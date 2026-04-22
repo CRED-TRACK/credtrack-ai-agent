@@ -2,6 +2,7 @@ package com.credtrack.ai_agent.service;
 
 import com.credtrack.ai_agent.model.StatementExtraction;
 import com.credtrack.ai_agent.model.TransactionExtraction;
+import com.credtrack.ai_agent.model.UtilityBillExtraction;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -199,7 +200,95 @@ public class ExtractionService {
         public double  confidence;
     }
 
+    /**
+     * Extracts utility bill data from an Eversource or National Grid bill email.
+     *
+     * @param billerKey  EVERSOURCE or NATIONAL_GRID
+     * @param emailBody  raw email text (may be HTML)
+     * @return UtilityBillExtraction — check isBill + confidence before using
+     */
+    public UtilityBillExtraction extractUtilityBill(String billerKey, String emailBody) {
+        // Use text-only preparation (no link appending) — bill data is always in the plain text,
+        // and National Grid tracking URLs would bloat the prompt to 10k+ chars causing hallucinations.
+        String cleanBody = prepareBodyTextOnly(emailBody);
+        log.info("Utility bill extraction input for biller {} ({} chars)", billerKey, cleanBody.length());
+
+        String prompt = """
+                You are a JSON-only financial data extractor. Respond with ONLY a valid JSON object — no explanations, no markdown, no code blocks.
+
+                Biller: %s
+
+                A utility bill email notifies the customer that their monthly bill is ready and shows the amount due, due date, and account number.
+
+                If this is NOT a utility bill (payment confirmation, outage notice, marketing email, etc.), respond with exactly:
+                {"isBill":false,"accountLastFour":null,"amountDue":0.0,"dueDate":null,"billDate":null,"billingPeriodStart":null,"billingPeriodEnd":null,"confidence":0.0}
+
+                If it IS a utility bill, extract:
+                - isBill: true
+                - accountLastFour: last 4 digits of the account number shown (e.g. "8616" from "******8616"), null if not found
+                - amountDue: total amount due as a number (no $ symbol), 0.0 if not found
+                - dueDate: payment due date in YYYY-MM-DD format, null if not found
+                - billDate: bill/statement date in YYYY-MM-DD format, null if not found. IMPORTANT: dates in the email may appear as MM/DD/YYYY (e.g. "09/17/2025") — always convert them to YYYY-MM-DD (e.g. "2025-09-17"). Never return the string "null"; use JSON null.
+                - billingPeriodStart: start of billing period in YYYY-MM-DD, null if not shown. Convert MM/DD/YYYY to YYYY-MM-DD if needed.
+                - billingPeriodEnd: end of billing period in YYYY-MM-DD, null if not shown. Convert MM/DD/YYYY to YYYY-MM-DD if needed.
+                - confidence: 0.0–1.0, use 0.85+ when amount and due date are clearly present
+
+                Email:
+                %s
+
+                JSON response:
+                """.formatted(billerKey, cleanBody);
+
+        try {
+            String raw = chatClient.prompt().user(prompt).call().content();
+            log.info("LLM utility bill response for biller {}: {}", billerKey, raw);
+
+            String json = extractJson(raw);
+            var dto = MAPPER.readValue(json, UtilityBillDto.class);
+            log.info("Utility bill extraction for biller {} — isBill={}, confidence={}",
+                    billerKey, dto.isBill, dto.confidence);
+
+            return new UtilityBillExtraction(dto.isBill, dto.accountLastFour, dto.amountDue,
+                    dto.dueDate, dto.billDate, dto.billingPeriodStart, dto.billingPeriodEnd,
+                    dto.confidence);
+
+        } catch (Exception e) {
+            log.error("Utility bill extraction failed for biller {}: {}", billerKey, e.getMessage());
+            return new UtilityBillExtraction(false, null, 0.0, null, null, null, null, 0.0);
+        }
+    }
+
+    /** Private DTO for deserializing the LLM's utility bill JSON response. */
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    private static class UtilityBillDto {
+        public boolean isBill;
+        public String  accountLastFour;
+        public double  amountDue;
+        public String  dueDate;
+        public String  billDate;
+        public String  billingPeriodStart;
+        public String  billingPeriodEnd;
+        public double  confidence;
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Strips HTML to plain text and truncates to MAX_BODY_CHARS.
+     * Does NOT append link URLs — used for utility bill extraction where all
+     * the relevant data (amount, due date, account number) is in the body text
+     * and appending the many tracking URLs would bloat the prompt unnecessarily.
+     */
+    private String prepareBodyTextOnly(String raw) {
+        if (raw == null || raw.isBlank()) return "";
+        String text;
+        if (raw.contains("<") && raw.contains(">")) {
+            text = Jsoup.parse(raw).text().replaceAll("\\s+", " ").trim();
+        } else {
+            text = raw.replaceAll("\\s+", " ").trim();
+        }
+        return text.length() > MAX_BODY_CHARS ? text.substring(0, MAX_BODY_CHARS) : text;
+    }
 
     /**
      * Strips HTML, extracts all link URLs separately (never truncated), truncates

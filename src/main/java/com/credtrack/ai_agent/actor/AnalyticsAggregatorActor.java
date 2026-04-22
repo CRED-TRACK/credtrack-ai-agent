@@ -117,7 +117,7 @@ public class AnalyticsAggregatorActor extends AbstractBehavior<AnalyticsAggregat
 
         if (since != null) {
             try {
-                total = backendApiClient.getUnbilledTotal(msg.userId(), msg.userCardId(), since);
+                total = backendApiClient.getUnbilledTotal(msg.userCardId());
             } catch (Exception e) {
                 getContext().getLog().warn("Failed to fetch unbilled total for card {}: {}",
                         msg.userCardId(), e.getMessage());
