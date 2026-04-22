@@ -11,6 +11,7 @@ import com.credtrack.ai_agent.actor.AnalyticsAgentHolder;
 import com.credtrack.ai_agent.actor.AnalyticsAggregatorActor;
 import com.credtrack.ai_agent.actor.EmailPipelineCoordinator;
 import com.credtrack.ai_agent.actor.PersistentStatementLedgerActor;
+import com.credtrack.ai_agent.actor.UtilityBillCoordinatorActor;
 import com.credtrack.ai_agent.service.BackendApiClient;
 import com.credtrack.ai_agent.service.ExtractionService;
 import com.credtrack.ai_agent.service.GmailService;
@@ -115,6 +116,32 @@ public class AkkaConfig {
                                 virtualThreadExecutor, statementLedger, analyticsAgentHolder,
                                 transactionScanIntervalMinutes),
                         "email-pipeline-coordinator",
+                        Props.empty(),
+                        replyTo),
+                Duration.ofSeconds(5),
+                system.scheduler()
+        ).toCompletableFuture().join();
+    }
+
+    /**
+     * UtilityBillCoordinatorActor — polls Gmail for Eversource and National Grid
+     * bill/payment emails. Spawned as a Spring bean so EmailPollScheduler can inject
+     * it and send Poll messages on the same schedule as the credit-card pipeline.
+     */
+    @Bean
+    public ActorRef<UtilityBillCoordinatorActor.Command> utilityBillCoordinator(
+            ActorSystem<SpawnProtocol.Command> system,
+            BackendApiClient backendApiClient,
+            GmailService gmailService,
+            ExtractionService extractionService,
+            Executor virtualThreadExecutor) {
+
+        return AskPattern.<SpawnProtocol.Command, ActorRef<UtilityBillCoordinatorActor.Command>>ask(
+                system,
+                replyTo -> new SpawnProtocol.Spawn<>(
+                        UtilityBillCoordinatorActor.create(
+                                backendApiClient, gmailService, extractionService, virtualThreadExecutor),
+                        "utility-bill-coordinator",
                         Props.empty(),
                         replyTo),
                 Duration.ofSeconds(5),

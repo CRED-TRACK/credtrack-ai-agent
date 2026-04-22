@@ -400,4 +400,73 @@ public class GmailService {
     }
 
     public record FetchResult(List<EmailMessage> emails, Long newHistoryId) {}
+
+    // ── Utility bill search ───────────────────────────────────────────────────
+
+    /**
+     * Searches for utility bill emails (Eversource or National Grid).
+     * Uses account last four as the keyword to scope results to this account.
+     *
+     * @param after only emails on or after this date (null = no limit)
+     */
+    public List<EmailMessage> searchUtilityBillEmails(String accessToken,
+                                                       String billerKey,
+                                                       String accountLastFour,
+                                                       LocalDate after) throws Exception {
+        String query = buildUtilityBillQuery(billerKey, accountLastFour, after);
+        if (query == null) return List.of();
+        log.info("Utility bill search for biller={} acct={}: {}", billerKey, accountLastFour, query);
+        Gmail gmail = buildClient(accessToken);
+        List<EmailMessage> emails = new ArrayList<>();
+        searchAndCollect(gmail, query, emails);
+        return emails;
+    }
+
+    /**
+     * Searches for utility payment confirmation emails (via Speedpay).
+     */
+    public List<EmailMessage> searchUtilityPaymentEmails(String accessToken,
+                                                          String billerKey,
+                                                          String accountLastFour,
+                                                          LocalDate after) throws Exception {
+        String query = buildUtilityPaymentQuery(billerKey, accountLastFour, after);
+        if (query == null) return List.of();
+        log.info("Utility payment search for biller={} acct={}: {}", billerKey, accountLastFour, query);
+        Gmail gmail = buildClient(accessToken);
+        List<EmailMessage> emails = new ArrayList<>();
+        searchAndCollect(gmail, query, emails);
+        return emails;
+    }
+
+    private String buildUtilityBillQuery(String billerKey, String accountLastFour, LocalDate after) {
+        String afterStr = after != null
+                ? " after:" + after.getYear() + "/" + String.format("%02d", after.getMonthValue())
+                          + "/" + String.format("%02d", after.getDayOfMonth())
+                : "";
+        return switch (billerKey) {
+            case "EVERSOURCE"    -> "from:notifications.eversource.com " + accountLastFour + afterStr;
+            // Use parent domain (no subdomain) so emails from any NationalGrid
+            // subdomain (emails.nationalgridus.com, notifications.nationalgridus.com, etc.)
+            // are all captured — National Grid has been observed to use multiple subdomains.
+            case "NATIONAL_GRID" -> "from:nationalgridus.com " + accountLastFour + afterStr;
+            default -> null;
+        };
+    }
+
+    private String buildUtilityPaymentQuery(String billerKey, String accountLastFour, LocalDate after) {
+        String afterStr = after != null
+                ? " after:" + after.getYear() + "/" + String.format("%02d", after.getMonthValue())
+                          + "/" + String.format("%02d", after.getDayOfMonth())
+                : "";
+        return switch (billerKey) {
+            // Eversource payments come from a dedicated speedpay address
+            case "EVERSOURCE"    -> "from:eversource_noreply@speedpay.com " + accountLastFour + afterStr;
+            // National Grid shares the generic speedpay address — include biller name to disambiguate.
+            // accountLastFour (e.g. "7069") is NOT added here because it appears embedded inside the
+            // full account string "9364377069*" in the email body and Gmail won't substring-match it
+            // as a standalone token. from: + "National Grid" is already specific enough.
+            case "NATIONAL_GRID" -> "from:noreply@speedpay.com \"National Grid\"" + afterStr;
+            default -> null;
+        };
+    }
 }

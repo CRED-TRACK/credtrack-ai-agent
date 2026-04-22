@@ -1,6 +1,7 @@
 package com.credtrack.ai_agent.service;
 
 import com.credtrack.ai_agent.model.GmailUserCredential;
+import com.credtrack.ai_agent.model.UtilityAccountInfo;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
@@ -11,7 +12,9 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -34,7 +37,7 @@ public class BackendApiClient {
                 .defaultHeader("Content-Type", "application/json")
                 .clientConnector(new org.springframework.http.client.reactive.ReactorClientHttpConnector(
                         reactor.netty.http.client.HttpClient.create()
-                                .responseTimeout(java.time.Duration.ofSeconds(30))))
+                                .responseTimeout(Duration.ofSeconds(30))))
                 .build();
 
         this.mapper = new ObjectMapper()
@@ -56,12 +59,9 @@ public class BackendApiClient {
     }
 
     /**
-     * Posts an extracted statement to the existing backend.
+     * Posts an extracted statement to the backend.
      * POST /internal/statements — 201 on success, 409 on duplicate.
-     */
-    /**
-     * Returns true if the statement was newly saved, false if it was a duplicate (409).
-     * Throws RuntimeException on any other error so the caller can log it as a failure.
+     * Returns true if newly saved, false if duplicate.
      */
     public boolean postStatement(String userId,
                                  String gmailMessageId,
@@ -216,7 +216,7 @@ public class BackendApiClient {
                                 String bankKey,
                                 String merchantName,
                                 String merchantCategory,
-                                java.math.BigDecimal amount,
+                                BigDecimal amount,
                                 String currency,
                                 LocalDate transactionDate,
                                 String transactionType,
@@ -283,7 +283,7 @@ public class BackendApiClient {
             Map<String, Object> body = new HashMap<>();
             // Backend uses SNAKE_CASE naming strategy — keys must match field names in snake_case
             body.put("history_id",    String.valueOf(historyId));
-            body.put("last_synced_at", java.time.LocalDateTime.now().toString());
+            body.put("last_synced_at", LocalDateTime.now().toString());
 
             webClient.patch()
                     .uri("/internal/gmail-credentials/{userId}", userId)
@@ -298,10 +298,130 @@ public class BackendApiClient {
     }
 
     /**
-     * Sums the amount of all transactions for a card after the given date.
-     * Calls GET /statements/unbilled?cardId={id} and returns the unbilledTotal field.
+     * Returns all registered utility accounts across all users.
+     * GET /internal/utility-accounts
      */
-    public double getUnbilledTotal(String userId, Long userCardId, LocalDate since) {
+    public List<UtilityAccountInfo> getUtilityAccounts() {
+        try {
+            @SuppressWarnings("unchecked")
+            List<Map<String, Object>> raw = (List<Map<String, Object>>) (List<?>) webClient.get()
+                    .uri("/internal/utility-accounts")
+                    .retrieve()
+                    .bodyToFlux(Map.class)
+                    .collectList()
+                    .block();
+            if (raw == null) return List.of();
+            return raw.stream()
+                    .map(m -> {
+                        Long id = m.get("id") instanceof Number n ? n.longValue() : null;
+                        boolean initDone = Boolean.TRUE.equals(m.get("utilityInitComplete"));
+                        return new UtilityAccountInfo(
+                                id,
+                                (String) m.get("userId"),
+                                (String) m.get("billerName"),
+                                (String) m.get("accountLastFour"),
+                                initDone);
+                    })
+                    .toList();
+        } catch (Exception e) {
+            log.error("getUtilityAccounts failed: {}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * Marks a utility account's one-time historical init scan as complete.
+     * POST /internal/utility-accounts/{accountId}/init-complete
+     */
+    public void markUtilityAccountInitComplete(Long accountId) {
+        try {
+            webClient.post()
+                    .uri("/internal/utility-accounts/" + accountId + "/init-complete")
+                    .retrieve()
+                    .toBodilessEntity()
+                    .block();
+            log.info("Utility account {} marked init-complete", accountId);
+        } catch (Exception e) {
+            log.error("markUtilityAccountInitComplete failed for {}: {}", accountId, e.getMessage());
+        }
+    }
+
+    /**
+     * Posts an extracted utility bill to the backend.
+     * POST /internal/utility-bills — 201 on success, 409 on duplicate.
+     * Returns true if newly saved, false if duplicate.
+     */
+    public boolean postUtilityBill(String userId,
+                                    String gmailMessageId,
+                                    String billerName,
+                                    String accountLastFour,
+                                    BigDecimal amountDue,
+                                    LocalDate dueDate,
+                                    LocalDate billDate,
+                                    LocalDate billingPeriodStart,
+                                    LocalDate billingPeriodEnd) {
+        try {
+            Map<String, Object> body = new HashMap<>();
+            body.put("user_id",               userId);
+            body.put("gmail_message_id",      gmailMessageId);
+            body.put("biller_name",           billerName);
+            body.put("account_last_four",     accountLastFour);
+            body.put("amount_due",            amountDue);
+            body.put("due_date",              dueDate != null ? dueDate.toString() : null);
+            body.put("bill_date",             billDate != null ? billDate.toString() : null);
+            body.put("billing_period_start",  billingPeriodStart != null ? billingPeriodStart.toString() : null);
+            body.put("billing_period_end",    billingPeriodEnd != null ? billingPeriodEnd.toString() : null);
+
+            webClient.post().uri("/internal/utility-bills").bodyValue(body)
+                    .retrieve().toBodilessEntity().block();
+            log.info("Utility bill saved: {} for user {} biller={}", gmailMessageId, userId, billerName);
+            return true;
+        } catch (Exception e) {
+            if (e.getMessage() != null && e.getMessage().contains("409")) {
+                log.debug("Duplicate utility bill skipped: {}", gmailMessageId);
+                return false;
+            }
+            throw new RuntimeException("Failed to save utility bill " + gmailMessageId + ": " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Posts an extracted utility payment to the backend.
+     * POST /internal/utility-payments — 204 on success, 409 on duplicate.
+     */
+    public void postUtilityPayment(String userId,
+                                    String gmailMessageId,
+                                    String billerName,
+                                    String accountLastFour,
+                                    BigDecimal paymentAmount,
+                                    LocalDate paymentDate) {
+        try {
+            Map<String, Object> body = new HashMap<>();
+            body.put("user_id",           userId);
+            body.put("gmail_message_id",  gmailMessageId);
+            body.put("biller_name",       billerName);
+            body.put("account_last_four", accountLastFour);
+            body.put("payment_amount",    paymentAmount);
+            body.put("payment_date",      paymentDate != null ? paymentDate.toString() : null);
+
+            webClient.post().uri("/internal/utility-payments").bodyValue(body)
+                    .retrieve().toBodilessEntity().block();
+            log.info("Utility payment saved: {} for user {} biller={} amount={}",
+                    gmailMessageId, userId, billerName, paymentAmount);
+        } catch (Exception e) {
+            if (e.getMessage() != null && e.getMessage().contains("409")) {
+                log.debug("Duplicate utility payment skipped: {}", gmailMessageId);
+            } else {
+                log.error("Failed to save utility payment {}: {}", gmailMessageId, e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Returns the sum of all unbilled transactions for a card since the last statement date.
+     * GET /statements/unbilled?cardId={id}
+     */
+    public double getUnbilledTotal(Long userCardId) {
         try {
             Map<?, ?> response = webClient.get()
                     .uri("/statements/unbilled?cardId=" + userCardId)
