@@ -128,11 +128,14 @@ public class StatementExtractorActor extends AbstractBehavior<StatementExtractor
 
         // Reject if the extracted card digits don't match any registered card.
         // Uses endsWith to handle banks that display extra leading digits (e.g. Amex
-        // shows 5 digits "51006" but registered lastFour may be stored as "51006" —
-        // LLM extracts "51006" → lastFour="1006", and "51006".endsWith("1006") = true).
+        // shows 5 digits "51006" → LLM extracts "51006" → lastFour="1006", and
+        // "51006".endsWith("1006") = true).
+        // Uses startsWith for the case where the LLM truncates trailing digits
+        // (e.g. LLM returns "5100" for a card stored as "51006" →
+        // "51006".startsWith("5100") = true).
         CardInfo matchedCard = src.registeredCards() == null ? null :
                 src.registeredCards().stream()
-                        .filter(c -> c.lastFour().endsWith(lastFour))
+                        .filter(c -> c.lastFour().endsWith(lastFour) || c.lastFour().startsWith(lastFour))
                         .findFirst().orElse(null);
         if (matchedCard == null) {
             getContext().getLog().info(
