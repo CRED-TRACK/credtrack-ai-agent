@@ -417,6 +417,78 @@ public class BackendApiClient {
         }
     }
 
+    // ── Raw analytics data records ─────────────────────────────────────────────
+
+    public record RawMonthCardRow(Long cardId, String bankKey, String lastFour, double amount) {}
+
+    public record RawMonthData(String month, List<RawMonthCardRow> cards) {}
+
+    /** Statement-based monthly data — replaces the old transaction-aggregated flat structure. */
+    public record RawCardStatementData(List<RawMonthData> monthlyData) {}
+
+    public record RawBillRow(String billerName, String accountLastFour,
+                              double amountDue, String billDate) {}
+
+    public record RawUtilityData(List<RawBillRow> bills) {}
+
+    /**
+     * Fetches statement-based monthly card data for the analytics actor.
+     * GET /internal/analytics/card-data?userId=X&months=6
+     * Backend groups CardStatement rows by YYYY-MM, applying COALESCE(statementBalance, paidAmount).
+     * Returns snake_case JSON; fields are extracted by key name.
+     */
+    @SuppressWarnings("unchecked")
+    public RawCardStatementData getRawCardData(String userId, int months) {
+        Map<String, Object> raw = webClient.get()
+                .uri("/internal/analytics/card-data?userId={uid}&months={m}", userId, months)
+                .retrieve()
+                .bodyToMono(Map.class)
+                .block();
+        if (raw == null) return new RawCardStatementData(List.of());
+
+        List<Map<String, Object>> monthsRaw =
+                (List<Map<String, Object>>) raw.getOrDefault("monthly_data", List.of());
+
+        List<RawMonthData> monthlyData = monthsRaw.stream().map(m -> {
+            String month = (String) m.get("month");
+            List<Map<String, Object>> cardsRaw =
+                    (List<Map<String, Object>>) m.getOrDefault("cards", List.of());
+            List<RawMonthCardRow> cards = cardsRaw.stream().map(c -> new RawMonthCardRow(
+                    ((Number) c.get("card_id")).longValue(),
+                    (String) c.get("bank_key"),
+                    (String) c.get("last_four"),
+                    ((Number) c.get("amount")).doubleValue()
+            )).toList();
+            return new RawMonthData(month, cards);
+        }).toList();
+
+        return new RawCardStatementData(monthlyData);
+    }
+
+    /**
+     * Fetches raw utility bill history for the analytics actor.
+     * GET /internal/analytics/utility-data?userId=X
+     */
+    @SuppressWarnings("unchecked")
+    public RawUtilityData getRawUtilityData(String userId) {
+        Map<String, Object> raw = webClient.get()
+                .uri("/internal/analytics/utility-data?userId={uid}", userId)
+                .retrieve()
+                .bodyToMono(Map.class)
+                .block();
+        if (raw == null) return new RawUtilityData(List.of());
+
+        List<Map<String, Object>> billsRaw = (List<Map<String, Object>>) raw.getOrDefault("bills", List.of());
+        List<RawBillRow> bills = billsRaw.stream().map(m -> new RawBillRow(
+                (String) m.get("biller_name"),
+                (String) m.get("account_last_four"),
+                m.get("amount_due") instanceof Number n ? n.doubleValue() : 0.0,
+                (String) m.get("bill_date")
+        )).toList();
+
+        return new RawUtilityData(bills);
+    }
+
     /**
      * Returns the sum of all unbilled transactions for a card since the last statement date.
      * GET /statements/unbilled?cardId={id}
