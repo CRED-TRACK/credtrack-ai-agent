@@ -7,8 +7,11 @@ import akka.actor.typed.SpawnProtocol;
 import akka.actor.typed.SupervisorStrategy;
 import akka.actor.typed.javadsl.AskPattern;
 import akka.actor.typed.javadsl.Behaviors;
+import akka.cluster.sharding.typed.javadsl.ClusterSharding;
+import akka.cluster.sharding.typed.javadsl.Entity;
 import com.credtrack.ai_agent.actor.AnalyticsAgentHolder;
 import com.credtrack.ai_agent.actor.AnalyticsAggregatorActor;
+import com.credtrack.ai_agent.actor.AnalyticsWorkerActor;
 import com.credtrack.ai_agent.actor.EmailPipelineCoordinator;
 import com.credtrack.ai_agent.actor.PersistentStatementLedgerActor;
 import com.credtrack.ai_agent.actor.UtilityBillCoordinatorActor;
@@ -147,6 +150,22 @@ public class AkkaConfig {
                 Duration.ofSeconds(5),
                 system.scheduler()
         ).toCompletableFuture().join();
+    }
+
+    /**
+     * ClusterSharding extension — used by AnalyticsController to get EntityRef
+     * handles for AnalyticsWorkerActor entities sharded by userId.
+     */
+    @Bean
+    public ClusterSharding clusterSharding(ActorSystem<SpawnProtocol.Command> system,
+                                           BackendApiClient backendApiClient,
+                                           Executor virtualThreadExecutor) {
+        ClusterSharding sharding = ClusterSharding.get(system);
+        sharding.init(Entity.of(
+                AnalyticsWorkerActor.TYPE_KEY,
+                ctx -> AnalyticsWorkerActor.create(ctx.getEntityId(), backendApiClient, virtualThreadExecutor)
+        ));
+        return sharding;
     }
 
     /**

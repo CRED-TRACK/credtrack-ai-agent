@@ -74,6 +74,17 @@
 			<artifactId>akka-persistence-testkit_2.13</artifactId>
 			<version>2.6.21</version>
 		</dependency>
+		<!-- Akka Cluster Sharding — analytics actors distributed by userId -->
+		<dependency>
+			<groupId>com.typesafe.akka</groupId>
+			<artifactId>akka-cluster-typed_2.13</artifactId>
+			<version>2.6.21</version>
+		</dependency>
+		<dependency>
+			<groupId>com.typesafe.akka</groupId>
+			<artifactId>akka-cluster-sharding-typed_2.13</artifactId>
+			<version>2.6.21</version>
+		</dependency>
 
 		<!-- Gmail API -->
 		<dependency>
