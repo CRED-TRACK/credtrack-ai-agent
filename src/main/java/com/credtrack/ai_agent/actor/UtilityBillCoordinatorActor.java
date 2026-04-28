@@ -17,6 +17,9 @@ import com.credtrack.ai_agent.service.GmailService;
 import java.io.IOException;
 import java.time.Duration;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -148,6 +151,24 @@ public class UtilityBillCoordinatorActor extends AbstractBehavior<UtilityBillCoo
                     List<UtilityAccountInfo> accounts = backendApiClient.getUtilityAccounts();
                     List<GmailUserCredential> creds   = backendApiClient.getAllGmailCredentials();
 
+                    for (GmailUserCredential cred : creds) {
+                        if (cred.getAccessToken() == null) continue;
+                        if (!isTokenExpiredOrSoon(cred.getTokenExpiryUtc())) continue;
+
+                        getContext().getLog().info(
+                                "Utility pipeline refreshing expiring Gmail token for user {}",
+                                cred.getUserId());
+                        String newToken = backendApiClient.refreshAccessToken(cred.getUserId());
+                        if (newToken != null) {
+                            cred.setAccessToken(newToken);
+                        } else {
+                            getContext().getLog().warn(
+                                    "Utility pipeline token refresh failed for user {}",
+                                    cred.getUserId());
+                            cred.setAccessToken(null);
+                        }
+                    }
+
                     Map<String, String> tokenMap = creds.stream()
                             .filter(c -> c.getAccessToken() != null)
                             .collect(Collectors.toMap(
@@ -263,5 +284,15 @@ public class UtilityBillCoordinatorActor extends AbstractBehavior<UtilityBillCoo
 
     private static String accountKey(UtilityAccountInfo a) {
         return a.userId() + ":" + a.billerName() + ":" + a.accountLastFour();
+    }
+
+    private boolean isTokenExpiredOrSoon(String tokenExpiryUtc) {
+        if (tokenExpiryUtc == null) return true;
+        try {
+            LocalDateTime expiry = LocalDateTime.parse(tokenExpiryUtc, DateTimeFormatter.ISO_LOCAL_DATE_TIME);
+            return LocalDateTime.now(ZoneOffset.UTC).isAfter(expiry.minusMinutes(5));
+        } catch (Exception e) {
+            return true;
+        }
     }
 }
