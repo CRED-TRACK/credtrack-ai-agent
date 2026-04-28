@@ -1,0 +1,27 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: unless-stopped
+
+  ai-agent:
+    build: .
+    ports:
+      - "8081:8081"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - BACKEND_BASE_URL=${BACKEND_BASE_URL}
+      - INTERNAL_SERVICE_KEY=${INTERNAL_SERVICE_KEY}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET}
+      - GMAIL_POLL_INTERVAL_MS=${GMAIL_POLL_INTERVAL_MS:-3600000}
+      - TRANSACTION_SCAN_INTERVAL_MINUTES=${TRANSACTION_SCAN_INTERVAL_MINUTES:-1440}
+    depends_on:
+      - ollama
+    restart: unless-stopped
+
+volumes:
+  ollama_data:

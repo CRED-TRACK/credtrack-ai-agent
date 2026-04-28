@@ -1,0 +1,6 @@
+target/
+*.md
+.git/
+.idea/
+*.iml
+presentation/
