@@ -10,7 +10,7 @@ import org.springframework.stereotype.Component;
 
 /**
  * Triggers the Akka email pipelines on a fixed interval.
- * Default: every 1 hour.
+ * Default: every 3 hours.
  * Override via GMAIL_POLL_INTERVAL_MS env var for testing.
  */
 @Component
@@ -27,7 +27,7 @@ public class EmailPollScheduler {
         this.utilityCoordinator = utilityCoordinator;
     }
 
-    @Scheduled(fixedRateString = "${gmail.poll-interval-ms:3600000}")
+    @Scheduled(fixedRateString = "${gmail.poll-interval-ms:10800000}")
     public void poll() {
         log.info("Triggering Gmail poll");
         coordinator.tell(EmailPipelineCoordinator.Poll.INSTANCE);

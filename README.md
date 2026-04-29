@@ -77,7 +77,7 @@ If Gemini fails or is rate-limited, the agent will try Ollama next.
 | `GEMINI_MAX_OUTPUT_TOKENS` | Gemini max output tokens | `1024` |
 | `GEMINI_TEMPERATURE` | Gemini sampling temperature | `0.1` |
 | `GEMINI_TIMEOUT_SECONDS` | Gemini request timeout | `60` |
-| `GMAIL_POLL_INTERVAL_MS` | Poll interval in ms | `3600000` (1 hour) |
+| `GMAIL_POLL_INTERVAL_MS` | Poll interval in ms | `10800000` (3 hours) |
 
 Recommended Gemini deployment profile:
 
