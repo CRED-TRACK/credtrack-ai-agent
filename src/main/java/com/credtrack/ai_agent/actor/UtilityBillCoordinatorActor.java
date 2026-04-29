@@ -13,6 +13,8 @@ import com.credtrack.ai_agent.model.UtilityAccountInfo;
 import com.credtrack.ai_agent.service.BackendApiClient;
 import com.credtrack.ai_agent.service.ExtractionService;
 import com.credtrack.ai_agent.service.GmailService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.time.Duration;
@@ -53,6 +55,8 @@ import java.util.stream.Collectors;
  *
  */
 public class UtilityBillCoordinatorActor extends AbstractBehavior<UtilityBillCoordinatorActor.Command> {
+
+    private static final Logger log = LoggerFactory.getLogger(UtilityBillCoordinatorActor.class);
 
     /** Lookback window for incremental normal-cycle polls (45 days = ~1.5 billing cycles). */
     private static final int NORMAL_LOOKBACK_DAYS = 45;
@@ -145,7 +149,7 @@ public class UtilityBillCoordinatorActor extends AbstractBehavior<UtilityBillCoo
     // ── Poll ──────────────────────────────────────────────────────────────────
 
     private Behavior<Command> onPoll(Poll ignored) {
-        getContext().getLog().info("Utility bill poll cycle started");
+        getContext().getLog().info("utility_poll event=start active_inits={}", activeAccounts.size());
         getContext().pipeToSelf(
                 CompletableFuture.supplyAsync(() -> {
                     List<UtilityAccountInfo> accounts = backendApiClient.getUtilityAccounts();
@@ -155,14 +159,14 @@ public class UtilityBillCoordinatorActor extends AbstractBehavior<UtilityBillCoo
                         if (cred.getAccessToken() == null) continue;
                         if (!isTokenExpiredOrSoon(cred.getTokenExpiryUtc())) continue;
 
-                        getContext().getLog().info(
+                        log.info(
                                 "Utility pipeline refreshing expiring Gmail token for user {}",
                                 cred.getUserId());
                         String newToken = backendApiClient.refreshAccessToken(cred.getUserId());
                         if (newToken != null) {
                             cred.setAccessToken(newToken);
                         } else {
-                            getContext().getLog().warn(
+                            log.warn(
                                     "Utility pipeline token refresh failed for user {}",
                                     cred.getUserId());
                             cred.setAccessToken(null);
@@ -187,9 +191,13 @@ public class UtilityBillCoordinatorActor extends AbstractBehavior<UtilityBillCoo
 
     private Behavior<Command> onAccountsFetched(AccountsFetched msg) {
         if (msg.accounts().isEmpty()) {
-            getContext().getLog().debug("No utility accounts registered — skipping");
+            getContext().getLog().debug("utility_poll event=no_accounts");
             return this;
         }
+
+        getContext().getLog().info(
+                "utility_poll event=fetched accounts={} tokenized_users={} active_inits={}",
+                msg.accounts().size(), msg.accessTokenByUserId().size(), activeAccounts.size());
 
         for (UtilityAccountInfo account : msg.accounts()) {
             String token = msg.accessTokenByUserId().get(account.userId());
@@ -246,7 +254,7 @@ public class UtilityBillCoordinatorActor extends AbstractBehavior<UtilityBillCoo
     }
 
     private Behavior<Command> onFetchFailed(FetchFailed msg) {
-        getContext().getLog().error("Failed to fetch utility accounts: {}", msg.reason());
+        getContext().getLog().error("utility_poll event=fetch_failed reason={}", msg.reason());
         return this;
     }
 
@@ -256,7 +264,7 @@ public class UtilityBillCoordinatorActor extends AbstractBehavior<UtilityBillCoo
         try {
             List<EmailMessage> billEmails = gmailService.searchUtilityBillEmails(
                     accessToken, account.billerName(), account.accountLastFour(), since);
-            getContext().getLog().info("Normal scan — {} bill email(s) for {} acct={}",
+            log.info("Normal scan — {} bill email(s) for {} acct={}",
                     billEmails.size(), account.billerName(), account.accountLastFour());
             for (EmailMessage email : billEmails) {
                 router.tell(new UtilityBillRouterActor.RouteUtilityEmail(
@@ -266,7 +274,7 @@ public class UtilityBillCoordinatorActor extends AbstractBehavior<UtilityBillCoo
 
             List<EmailMessage> paymentEmails = gmailService.searchUtilityPaymentEmails(
                     accessToken, account.billerName(), account.accountLastFour(), since);
-            getContext().getLog().info("Normal scan — {} payment email(s) for {} acct={}",
+            log.info("Normal scan — {} payment email(s) for {} acct={}",
                     paymentEmails.size(), account.billerName(), account.accountLastFour());
             for (EmailMessage email : paymentEmails) {
                 router.tell(new UtilityBillRouterActor.RouteUtilityEmail(
@@ -275,7 +283,7 @@ public class UtilityBillCoordinatorActor extends AbstractBehavior<UtilityBillCoo
             }
 
         } catch (Exception e) {
-            getContext().getLog().error("Normal scan failed for {} acct={}: {}",
+            log.error("Normal scan failed for {} acct={}: {}",
                     account.billerName(), account.accountLastFour(), e.getMessage());
         }
     }

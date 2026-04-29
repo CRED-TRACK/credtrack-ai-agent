@@ -1,6 +1,12 @@
-target/
-*.md
-.git/
-.idea/
-*.iml
-presentation/
+.git
+.gitignore
+.idea
+.mvn/wrapper/maven-wrapper.jar
+target
+*.log
+.DS_Store
+.env
+CredTrack AI.pdf
+CredTrack_AI_Report.pdf
+CredTrack AI.pptx
+CredTrack_AI_Report.docx

@@ -9,7 +9,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.jsoup.Jsoup;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDate;
@@ -17,7 +16,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Calls the LLM (via Spring AI ChatClient) to extract statement data from
+ * Calls the configured LLM provider to extract statement data from
  * a raw bank email body.
  *
  * Pre-processing pipeline before the LLM call:
@@ -42,10 +41,10 @@ public class ExtractionService {
     // Matches a JSON object anywhere in the LLM response (handles extra prose/markdown)
     private static final Pattern JSON_BLOCK = Pattern.compile("\\{[\\s\\S]*}", Pattern.DOTALL);
 
-    private final ChatClient chatClient;
+    private final LlmGateway llmGateway;
 
-    public ExtractionService(ChatClient.Builder chatClientBuilder) {
-        this.chatClient = chatClientBuilder.build();
+    public ExtractionService(LlmGateway llmGateway) {
+        this.llmGateway = llmGateway;
     }
 
     /**
@@ -57,7 +56,7 @@ public class ExtractionService {
      */
     public StatementExtraction extract(String bankKey, String emailBody) {
         String cleanBody = prepareBody(emailBody);
-        log.info("Statement extraction input for bank {} ({} chars)", bankKey, cleanBody.length());
+        log.info("extraction_event=start type=statement bank={} body_chars={}", bankKey, cleanBody.length());
 
         String prompt = """
                 You are a JSON-only financial data extractor. Respond with ONLY a valid JSON object — no explanations, no markdown, no code blocks.
@@ -91,21 +90,18 @@ public class ExtractionService {
                 """.formatted(bankKey, cleanBody);
 
         try {
-            String raw = chatClient.prompt()
-                    .user(prompt)
-                    .call()
-                    .content();
+            String raw = llmGateway.generate(prompt, "statement-extraction");
 
-            log.info("LLM raw response for bank {}: {}", bankKey, raw);
+            log.info("extraction_event=raw_response type=statement bank={} response_chars={}", bankKey, raw.length());
 
             String json = extractJson(raw);
             StatementExtraction result = MAPPER.readValue(json, StatementExtraction.class);
-            log.info("Extraction for bank {} — isStatement={}, confidence={}",
+            log.info("extraction_event=done type=statement bank={} is_statement={} confidence={}",
                     bankKey, result.isStatement(), result.getConfidence());
             return result;
 
         } catch (Exception e) {
-            log.error("LLM extraction failed for bank {}: {}", bankKey, e.getMessage());
+            log.error("extraction_event=failed type=statement bank={} error={}", bankKey, summarize(e.getMessage()));
             StatementExtraction failed = new StatementExtraction();
             failed.setStatement(false);
             failed.setConfidence(0.0);
@@ -122,7 +118,7 @@ public class ExtractionService {
      */
     public TransactionExtraction extractTransaction(String bankKey, String emailBody) {
         String cleanBody = prepareBody(emailBody);
-        log.info("Transaction extraction input for bank {} ({} chars)", bankKey, cleanBody.length());
+        log.info("extraction_event=start type=transaction bank={} body_chars={}", bankKey, cleanBody.length());
 
         String prompt = """
                 You are a JSON-only financial data extractor. Respond with ONLY a valid JSON object — no explanations, no markdown, no code blocks.
@@ -153,12 +149,9 @@ public class ExtractionService {
                 """.formatted(bankKey, cleanBody);
 
         try {
-            String raw = chatClient.prompt()
-                    .user(prompt)
-                    .call()
-                    .content();
+            String raw = llmGateway.generate(prompt, "transaction-extraction");
 
-            log.info("LLM transaction response for bank {}: {}", bankKey, raw);
+            log.info("extraction_event=raw_response type=transaction bank={} response_chars={}", bankKey, raw.length());
 
             String json = extractJson(raw);
             TransactionDto dto = MAPPER.readValue(json, TransactionDto.class);
@@ -181,7 +174,7 @@ public class ExtractionService {
             );
 
         } catch (Exception e) {
-            log.error("LLM transaction extraction failed for bank {}: {}", bankKey, e.getMessage());
+            log.error("extraction_event=failed type=transaction bank={} error={}", bankKey, summarize(e.getMessage()));
             return new TransactionExtraction(false, null, null, 0.0, "USD", null, "DEBIT", null, 0.0);
         }
     }
@@ -211,7 +204,7 @@ public class ExtractionService {
         // Use text-only preparation (no link appending) — bill data is always in the plain text,
         // and National Grid tracking URLs would bloat the prompt to 10k+ chars causing hallucinations.
         String cleanBody = prepareBodyTextOnly(emailBody);
-        log.info("Utility bill extraction input for biller {} ({} chars)", billerKey, cleanBody.length());
+        log.info("extraction_event=start type=utility_bill biller={} body_chars={}", billerKey, cleanBody.length());
 
         String prompt = """
                 You are a JSON-only financial data extractor. Respond with ONLY a valid JSON object — no explanations, no markdown, no code blocks.
@@ -240,12 +233,13 @@ public class ExtractionService {
                 """.formatted(billerKey, cleanBody);
 
         try {
-            String raw = chatClient.prompt().user(prompt).call().content();
-            log.info("LLM utility bill response for biller {}: {}", billerKey, raw);
+            String raw = llmGateway.generate(prompt, "utility-bill-extraction");
+            log.info("extraction_event=raw_response type=utility_bill biller={} response_chars={}",
+                    billerKey, raw.length());
 
             String json = extractJson(raw);
             var dto = MAPPER.readValue(json, UtilityBillDto.class);
-            log.info("Utility bill extraction for biller {} — isBill={}, confidence={}",
+            log.info("extraction_event=done type=utility_bill biller={} is_bill={} confidence={}",
                     billerKey, dto.isBill, dto.confidence);
 
             return new UtilityBillExtraction(dto.isBill, dto.accountLastFour, dto.amountDue,
@@ -253,7 +247,8 @@ public class ExtractionService {
                     dto.confidence);
 
         } catch (Exception e) {
-            log.error("Utility bill extraction failed for biller {}: {}", billerKey, e.getMessage());
+            log.error("extraction_event=failed type=utility_bill biller={} error={}",
+                    billerKey, summarize(e.getMessage()));
             return new UtilityBillExtraction(false, null, 0.0, null, null, null, null, 0.0);
         }
     }
@@ -343,5 +338,12 @@ public class ExtractionService {
         if (m.find()) return m.group();
 
         throw new IllegalArgumentException("No JSON object found in LLM response: " + raw);
+    }
+
+    private String summarize(String value) {
+        if (value == null || value.isBlank()) {
+            return "unknown";
+        }
+        return value.replaceAll("\\s+", " ").trim();
     }
 }
