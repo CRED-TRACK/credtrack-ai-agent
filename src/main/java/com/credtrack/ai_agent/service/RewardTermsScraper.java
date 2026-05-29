@@ -78,9 +78,14 @@ public class RewardTermsScraper {
         String rawHtml;
         int status;
         try {
+            // Some issuers (Amex) return a 56-byte SPA shell to bot-shaped UAs. Send a
+            // realistic browser header set so we get the static T&C HTML they serve to humans.
             HttpRequest req = HttpRequest.newBuilder(URI.create(card.termsUrl()))
-                    .header("User-Agent", "CredTrackBot/1.0 (+contact@credtrack.app)")
-                    .header("Accept", "text/html,application/xhtml+xml")
+                    .header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15")
+                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Accept-Encoding", "identity")
                     .GET()
                     .timeout(Duration.ofSeconds(20))
                     .build();
