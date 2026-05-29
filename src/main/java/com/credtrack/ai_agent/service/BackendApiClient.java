@@ -508,4 +508,86 @@ public class BackendApiClient {
         }
         return 0.0;
     }
+
+    /**
+     * GET /internal/card-products-to-scrape — returns card_products with terms_url
+     * and ≥1 active user_card. Each row includes the current document's content hash
+     * so the scraper can short-circuit unchanged pages.
+     */
+    public java.util.List<com.credtrack.ai_agent.model.CardProductToScrape> getCardProductsToScrape() {
+        return webClient.get()
+                .uri("/internal/card-products-to-scrape")
+                .retrieve()
+                .bodyToFlux(com.credtrack.ai_agent.model.CardProductToScrape.class)
+                .collectList()
+                .block();
+    }
+
+    /**
+     * POST /internal/card-terms-documents — records the scraped HTML doc + hash.
+     * Returns the document id (used as source_document_id on rule rows) and a flag
+     * indicating whether the hash matched the existing current doc (idempotent skip).
+     */
+    public DocumentSaveResult postCardTermsDocument(Long cardProductId,
+                                                    String sourceUrl,
+                                                    String contentHash,
+                                                    String cleanedText,
+                                                    Integer httpStatus,
+                                                    String extractorModel,
+                                                    Integer extractedRulesCount) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("card_product_id", cardProductId);
+        body.put("source_url", sourceUrl);
+        body.put("content_hash", contentHash);
+        body.put("cleaned_text", cleanedText);
+        body.put("http_status", httpStatus);
+        body.put("extractor_model", extractorModel);
+        body.put("extracted_rules_count", extractedRulesCount);
+        try {
+            return webClient.post()
+                    .uri("/internal/card-terms-documents")
+                    .bodyValue(body)
+                    .retrieve()
+                    .bodyToMono(DocumentSaveResult.class)
+                    .block();
+        } catch (Exception e) {
+            log.error("postCardTermsDocument failed product_id={} hash={} error={}",
+                    cardProductId, contentHash, e.getMessage());
+            return null;
+        }
+    }
+
+    /** Result of POST /internal/card-terms-documents. */
+    public record DocumentSaveResult(
+            @com.fasterxml.jackson.annotation.JsonProperty("id") Long id,
+            @com.fasterxml.jackson.annotation.JsonProperty("duplicate_of_current") boolean duplicateOfCurrent
+    ) {}
+
+    /**
+     * POST /internal/card-reward-rules — replace-all for LLM_SCRAPED rules
+     * of one card_product. SEED + USER_OVERRIDE rules untouched server-side.
+     */
+    public Map<String, Object> postRewardRules(Long cardProductId,
+                                               Long documentId,
+                                               Float minConfidence,
+                                               java.util.List<Map<String, Object>> rules) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("card_product_id", cardProductId);
+        body.put("document_id", documentId);
+        body.put("min_confidence", minConfidence);
+        body.put("rules", rules);
+        try {
+            return webClient.post()
+                    .uri("/internal/card-reward-rules")
+                    .bodyValue(body)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .map(m -> (Map<String, Object>) m)
+                    .block();
+        } catch (Exception e) {
+            log.error("postRewardRules failed product_id={} error={}",
+                    cardProductId, e.getMessage());
+            return Map.of("error", e.getMessage());
+        }
+    }
 }

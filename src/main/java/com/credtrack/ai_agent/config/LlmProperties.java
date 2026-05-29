@@ -32,6 +32,9 @@ public class LlmProperties {
     public static class Gemini {
         private String apiKey = "";
         private String model = "gemini-2.5-flash-lite";
+        private String embedModel = "gemini-embedding-001";
+        private int embedDim = 768;     // gemini-embedding-001 default outputDim
+        private int embedOutputDim = 768; // sent to Gemini as outputDimensionality
         private String baseUrl = "https://generativelanguage.googleapis.com";
         private int maxOutputTokens = 1024;
         private double temperature = 0.1;
@@ -52,6 +55,15 @@ public class LlmProperties {
         public void setModel(String model) {
             this.model = model;
         }
+
+        public String getEmbedModel() { return embedModel; }
+        public void setEmbedModel(String embedModel) { this.embedModel = embedModel; }
+
+        public int getEmbedDim() { return embedDim; }
+        public void setEmbedDim(int embedDim) { this.embedDim = embedDim; }
+
+        public int getEmbedOutputDim() { return embedOutputDim; }
+        public void setEmbedOutputDim(int embedOutputDim) { this.embedOutputDim = embedOutputDim; }
 
         public String getBaseUrl() {
             return baseUrl;

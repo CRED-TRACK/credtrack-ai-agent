@@ -77,6 +77,48 @@ public class LlmGateway {
         throw new IllegalStateException("No LLM provider succeeded for " + operationName + ". Attempts: " + failures);
     }
 
+    public float[] embed(String text, String operationName) {
+        List<String> providers = orderedProviders();
+        List<String> failures = new ArrayList<>();
+        int textChars = text == null ? 0 : text.length();
+
+        log.info("llm_event=embed_start operation={} providers={} text_chars={}",
+                operationName, providers, textChars);
+
+        int attempt = 0;
+        for (String provider : providers) {
+            attempt++;
+            LlmClient client = clientsByProvider.get(provider);
+            if (client == null || !client.isAvailable() || !client.supportsEmbeddings()) {
+                String reason = client == null ? "provider-not-registered"
+                        : (!client.isAvailable() ? client.availabilityDetails() : "embeddings-unsupported");
+                log.warn("llm_event=embed_skip operation={} attempt={} provider={} reason={}",
+                        operationName, attempt, provider, reason);
+                failures.add(provider + ": " + reason);
+                continue;
+            }
+            long startedAt = System.nanoTime();
+            try {
+                log.info("llm_event=embed_attempt operation={} attempt={} provider={} model={} text_chars={}",
+                        operationName, attempt, provider, client.embedModelName(), textChars);
+                float[] vec = client.embed(text);
+                long durationMs = elapsedMs(startedAt);
+                log.info("llm_event=embed_success operation={} attempt={} provider={} model={} duration_ms={} dim={}",
+                        operationName, attempt, provider, client.embedModelName(), durationMs, vec.length);
+                return vec;
+            } catch (Exception e) {
+                long durationMs = elapsedMs(startedAt);
+                String error = summarizeError(e);
+                log.warn("llm_event=embed_failure operation={} attempt={} provider={} model={} duration_ms={} error={}",
+                        operationName, attempt, provider, client.embedModelName(), durationMs, error);
+                failures.add(provider + ": " + error);
+            }
+        }
+        log.error("llm_event=embed_exhausted operation={} providers={} failures={}",
+                operationName, providers, failures);
+        throw new IllegalStateException("No LLM provider succeeded for embed " + operationName + ". Attempts: " + failures);
+    }
+
     public List<String> orderedProvidersForLogging() {
         return orderedProviders();
     }

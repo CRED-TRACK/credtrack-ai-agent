@@ -113,6 +113,70 @@ public class GeminiLlmClient implements LlmClient {
         return value.replaceAll("\\s+", " ").trim();
     }
 
+    @Override
+    public boolean supportsEmbeddings() { return isAvailable(); }
+
+    @Override
+    public int embeddingDim() { return properties.getGemini().getEmbedDim(); }
+
+    @Override
+    public String embedModelName() { return properties.getGemini().getEmbedModel(); }
+
+    @Override
+    public float[] embed(String text) {
+        if (!isAvailable()) {
+            throw new IllegalStateException("Gemini API key is not configured");
+        }
+        if (text == null || text.isBlank()) {
+            throw new IllegalArgumentException("embed text is empty");
+        }
+
+        // Gemini embedContent payload — gemini-embedding-001 requires `model` field in body
+        String fullModel = "models/" + properties.getGemini().getEmbedModel();
+        EmbedRequest body = new EmbedRequest(
+            fullModel,
+            new Content(new Part[]{new Part(text)}),
+            properties.getGemini().getEmbedOutputDim()
+        );
+
+        String responseBody = webClient.post()
+                .uri("/v1beta/models/{model}:embedContent", properties.getGemini().getEmbedModel())
+                .header("x-goog-api-key", properties.getGemini().getApiKey())
+                .contentType(MediaType.APPLICATION_JSON)
+                .bodyValue(body)
+                .retrieve()
+                .onStatus(HttpStatusCode::isError, response ->
+                        response.bodyToMono(String.class)
+                                .defaultIfEmpty("")
+                                .flatMap(b -> Mono.error(new IllegalStateException(
+                                        "Gemini embed API error " + response.statusCode().value() + ": " + b))))
+                .bodyToMono(String.class)
+                .block(Duration.ofSeconds(properties.getGemini().getTimeoutSeconds()));
+
+        if (responseBody == null || responseBody.isBlank()) {
+            throw new IllegalStateException("Gemini embed returned empty response");
+        }
+        try {
+            JsonNode root = objectMapper.readTree(responseBody);
+            JsonNode values = root.path("embedding").path("values");
+            if (!values.isArray() || values.isEmpty()) {
+                throw new IllegalStateException("Gemini embed response missing embedding.values: " + responseBody);
+            }
+            float[] out = new float[values.size()];
+            for (int i = 0; i < values.size(); i++) {
+                out[i] = (float) values.get(i).asDouble();
+            }
+            return out;
+        } catch (Exception e) {
+            log.error("llm_provider=gemini event=embed_parse_failure model={} error={}",
+                    properties.getGemini().getEmbedModel(),
+                    summarize(e.getMessage()));
+            throw new IllegalStateException("Failed to parse Gemini embed response", e);
+        }
+    }
+
+    private record EmbedRequest(String model, Content content, Integer outputDimensionality) {}
+
     private record GeminiRequest(Content[] contents, GenerationConfig generationConfig) {}
 
     private record Content(Part[] parts) {}
