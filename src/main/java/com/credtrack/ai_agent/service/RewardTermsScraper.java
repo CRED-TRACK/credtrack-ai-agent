@@ -104,6 +104,14 @@ public class RewardTermsScraper {
         if (cleaned.isEmpty()) {
             return errorResult(card, status, "cleaned text empty");
         }
+        // Thin-content guard — page likely JS-rendered shell (Amex/Cloudflare). Bail before
+        // calling LLM. Document is NOT written so we don't pollute audit trail with shells.
+        if (cleaned.length() < 500) {
+            log.warn("scrape_event=thin_content card_product_id={} cleaned_chars={} url={}",
+                    card.cardProductId(), cleaned.length(), card.termsUrl());
+            return errorResult(card, status,
+                    "thin_content (" + cleaned.length() + " chars) — page likely JS-rendered. Needs headless browser.");
+        }
 
         // 3. Hash (sha256) for idempotency
         String hash = sha256(cleaned);
