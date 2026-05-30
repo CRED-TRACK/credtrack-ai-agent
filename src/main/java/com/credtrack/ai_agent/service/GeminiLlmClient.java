@@ -53,6 +53,15 @@ public class GeminiLlmClient implements LlmClient {
 
     @Override
     public String generate(String prompt) {
+        return generateInternal(prompt, "application/json");
+    }
+
+    @Override
+    public String generateText(String prompt) {
+        return generateInternal(prompt, "text/plain");
+    }
+
+    private String generateInternal(String prompt, String mimeType) {
         if (!isAvailable()) {
             throw new IllegalStateException("Gemini API key is not configured");
         }
@@ -60,7 +69,7 @@ public class GeminiLlmClient implements LlmClient {
         GeminiRequest request = new GeminiRequest(
                 new Content[]{new Content(new Part[]{new Part(prompt)})},
                 new GenerationConfig(
-                        "application/json",
+                        mimeType,
                         properties.getGemini().getTemperature(),
                         properties.getGemini().getMaxOutputTokens()
                 )

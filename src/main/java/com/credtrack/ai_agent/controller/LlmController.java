@@ -53,7 +53,7 @@ public class LlmController {
         if (req == null || req.prompt() == null || req.prompt().isBlank()) {
             return ResponseEntity.badRequest().body(new ChatResponse(""));
         }
-        String answer = llmGateway.generate(req.prompt(), "chat-advisor");
+        String answer = llmGateway.generateText(req.prompt(), "chat-advisor");
         log.info("chat_event=served prompt_chars={} answer_chars={}",
                 req.prompt().length(), answer == null ? 0 : answer.length());
         return ResponseEntity.ok(new ChatResponse(answer == null ? "" : answer));

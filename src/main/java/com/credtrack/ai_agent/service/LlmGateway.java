@@ -26,7 +26,15 @@ public class LlmGateway {
         this.properties = properties;
     }
 
+    public String generateText(String prompt, String operationName) {
+        return generateWith(prompt, operationName, true);
+    }
+
     public String generate(String prompt, String operationName) {
+        return generateWith(prompt, operationName, false);
+    }
+
+    private String generateWith(String prompt, String operationName, boolean plainText) {
         List<String> providers = orderedProviders();
         List<String> failures = new ArrayList<>();
         int promptChars = prompt == null ? 0 : prompt.length();
@@ -55,9 +63,10 @@ public class LlmGateway {
 
             long startedAt = System.nanoTime();
             try {
-                log.info("llm_event=attempt operation={} attempt={} provider={} model={} prompt_chars={}",
-                        operationName, attempt, provider, client.modelName(), promptChars);
-                String response = client.generate(prompt);
+                log.info("llm_event=attempt operation={} attempt={} provider={} model={} prompt_chars={} mode={}",
+                        operationName, attempt, provider, client.modelName(), promptChars,
+                        plainText ? "text" : "json");
+                String response = plainText ? client.generateText(prompt) : client.generate(prompt);
                 long durationMs = elapsedMs(startedAt);
                 int responseChars = response == null ? 0 : response.length();
                 log.info("llm_event=success operation={} attempt={} provider={} model={} duration_ms={} response_chars={}",

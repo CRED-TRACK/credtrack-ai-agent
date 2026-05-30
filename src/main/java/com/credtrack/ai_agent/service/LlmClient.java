@@ -8,6 +8,11 @@ public interface LlmClient {
 
     String generate(String prompt);
 
+    /** Plain-text generation (no JSON mode). Default = same as generate(). */
+    default String generateText(String prompt) {
+        return generate(prompt);
+    }
+
     default String modelName() {
         return "unknown";
     }
