@@ -9,9 +9,10 @@ RUN ./mvnw package -DskipTests -B
 # Install Playwright Chromium into a known cache dir so the runtime image can copy it.
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 RUN mkdir -p /ms-playwright \
-    && PW_JAR=$(find /root/.m2/repository/com/microsoft/playwright -name 'playwright-*.jar' | grep -v javadoc | grep -v sources | head -1) \
-    && echo "playwright jar: $PW_JAR" \
-    && java -cp "$PW_JAR" com.microsoft.playwright.CLI install chromium
+    && CP=$(find /root/.m2/repository/com/microsoft/playwright -name '*.jar' \
+            | grep -v javadoc | grep -v sources | tr '\n' ':') \
+    && echo "playwright classpath: $CP" \
+    && java -cp "$CP" com.microsoft.playwright.CLI install chromium
 
 FROM --platform=linux/amd64 eclipse-temurin:21-jre-jammy
 WORKDIR /app
