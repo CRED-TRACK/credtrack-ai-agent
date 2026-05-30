@@ -189,8 +189,42 @@ public class RewardTermsScraper {
             }
         }
 
-        log.info("scrape_event=done card_product_id={} status={} cleaned_chars={} rules={} document_id={} upsert={}",
-                card.cardProductId(), status, cleaned.length(), rules.size(), documentId, upsertResult);
+        // Chunk + embed + post chunks for RAG retrieval. Best-effort: if any individual
+        // chunk's embed call fails we skip it; the chat answer just has fewer sources.
+        int embeddedChunks = 0;
+        if (documentId != null) {
+            List<TermsChunker.Chunk> chunks = TermsChunker.chunk(cleaned);
+            List<Map<String, Object>> chunkPayload = new ArrayList<>();
+            for (TermsChunker.Chunk ch : chunks) {
+                try {
+                    float[] vec = llmGateway.embed(ch.text(), "reward-terms-embed");
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("chunk_index", ch.index());
+                    row.put("chunk_text", ch.text());
+                    row.put("heading_path", ch.headingPath());
+                    row.put("token_count", ch.tokenCount());
+                    List<Float> embedList = new ArrayList<>(vec.length);
+                    for (float f : vec) embedList.add(f);
+                    row.put("embedding", embedList);
+                    chunkPayload.add(row);
+                    embeddedChunks++;
+                } catch (Exception e) {
+                    log.warn("scrape_event=embed_chunk_failed card_product_id={} chunk={} error={}",
+                            card.cardProductId(), ch.index(), e.getMessage());
+                }
+            }
+            if (!chunkPayload.isEmpty()) {
+                try {
+                    backendApiClient.postCardTermsChunks(documentId, card.cardProductId(), chunkPayload);
+                } catch (Exception e) {
+                    log.warn("scrape_event=chunks_post_failed card_product_id={} error={}",
+                            card.cardProductId(), e.getMessage());
+                }
+            }
+        }
+
+        log.info("scrape_event=done card_product_id={} status={} cleaned_chars={} rules={} chunks={} document_id={} upsert={}",
+                card.cardProductId(), status, cleaned.length(), rules.size(), embeddedChunks, documentId, upsertResult);
 
         return ScrapedTermsResult.builder()
                 .cardProductId(card.cardProductId())

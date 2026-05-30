@@ -563,6 +563,29 @@ public class BackendApiClient {
             @com.fasterxml.jackson.annotation.JsonProperty("duplicate_of_current") boolean duplicateOfCurrent
     ) {}
 
+    /** POST /internal/card-terms-chunks — replace-all chunks for one document. */
+    public Map<String, Object> postCardTermsChunks(Long documentId,
+                                                   Long cardProductId,
+                                                   java.util.List<java.util.Map<String, Object>> chunks) {
+        Map<String, Object> body = new HashMap<>();
+        body.put("document_id", documentId);
+        body.put("card_product_id", cardProductId);
+        body.put("chunks", chunks);
+        try {
+            return webClient.post()
+                    .uri("/internal/card-terms-chunks")
+                    .bodyValue(body)
+                    .retrieve()
+                    .bodyToMono(Map.class)
+                    .map(m -> (Map<String, Object>) m)
+                    .block();
+        } catch (Exception e) {
+            log.error("postCardTermsChunks failed document_id={} error={}",
+                    documentId, e.getMessage());
+            return Map.of("error", e.getMessage());
+        }
+    }
+
     /**
      * POST /internal/card-reward-rules — replace-all for LLM_SCRAPED rules
      * of one card_product. SEED + USER_OVERRIDE rules untouched server-side.
