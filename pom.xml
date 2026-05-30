@@ -111,6 +111,13 @@
 			<version>1.17.2</version>
 		</dependency>
 
+		<!-- Headless Chromium for JS-rendered issuer pages (Amex Cloudflare shell, Discover calendar) -->
+		<dependency>
+			<groupId>com.microsoft.playwright</groupId>
+			<artifactId>playwright</artifactId>
+			<version>1.50.0</version>
+		</dependency>
+
 		<!-- Loads .env file automatically (same as backend) -->
 		<dependency>
 			<groupId>me.paulschwarz</groupId>

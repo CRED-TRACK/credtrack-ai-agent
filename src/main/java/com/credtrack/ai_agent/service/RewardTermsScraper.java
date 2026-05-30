@@ -52,17 +52,20 @@ public class RewardTermsScraper {
     private final HttpClient httpClient;
     private final BackendApiClient backendApiClient;
     private final LlmProperties llmProperties;
+    private final PlaywrightRenderer playwrightRenderer;
     private final float minConfidence;
 
     public RewardTermsScraper(LlmGateway llmGateway,
                               ObjectMapper objectMapper,
                               BackendApiClient backendApiClient,
                               LlmProperties llmProperties,
+                              PlaywrightRenderer playwrightRenderer,
                               @Value("${rewards.scrape.min-confidence:0.6}") float minConfidence) {
         this.llmGateway = llmGateway;
         this.objectMapper = objectMapper;
         this.backendApiClient = backendApiClient;
         this.llmProperties = llmProperties;
+        this.playwrightRenderer = playwrightRenderer;
         this.minConfidence = minConfidence;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(20))
@@ -109,13 +112,27 @@ public class RewardTermsScraper {
         if (cleaned.isEmpty()) {
             return errorResult(card, status, "cleaned text empty");
         }
-        // Thin-content guard — page likely JS-rendered shell (Amex/Cloudflare). Bail before
-        // calling LLM. Document is NOT written so we don't pollute audit trail with shells.
+        // Thin-content fallback — page likely JS-rendered shell (Amex/Cloudflare).
+        // Try headless Chromium render via Playwright. If that also fails, bail.
         if (cleaned.length() < 500) {
-            log.warn("scrape_event=thin_content card_product_id={} cleaned_chars={} url={}",
+            log.info("scrape_event=thin_content_fallback card_product_id={} raw_chars={} url={} trying_playwright=true",
                     card.cardProductId(), cleaned.length(), card.termsUrl());
-            return errorResult(card, status,
-                    "thin_content (" + cleaned.length() + " chars) — page likely JS-rendered. Needs headless browser.");
+            String rendered = playwrightRenderer.renderHtml(card.termsUrl());
+            if (rendered == null || rendered.isBlank()) {
+                return errorResult(card, status,
+                        "thin_content (" + cleaned.length() + " chars) and playwright render unavailable/failed.");
+            }
+            Document rdoc = Jsoup.parse(rendered);
+            rdoc.select("script, style, noscript, nav, footer, header, aside").remove();
+            cleaned = rdoc.text().replaceAll("\\s+", " ").trim();
+            if (cleaned.length() < 500) {
+                log.warn("scrape_event=thin_content_after_playwright card_product_id={} cleaned_chars={}",
+                        card.cardProductId(), cleaned.length());
+                return errorResult(card, status,
+                        "thin_content (" + cleaned.length() + " chars) even after headless render.");
+            }
+            log.info("scrape_event=playwright_recovered card_product_id={} cleaned_chars={}",
+                    card.cardProductId(), cleaned.length());
         }
 
         // 3. Hash (sha256) for idempotency
